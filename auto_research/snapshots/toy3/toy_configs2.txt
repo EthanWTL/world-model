@@ -1,0 +1,8 @@
+--name L4_none_ctrl --layers 4 --window -1 --ttt-layers none
+--name L4_none_dot_both --layers 4 --window -1 --ttt-params both
+--name L4_none_dot_up --layers 4 --window -1 --ttt-params up
+--name L4_none_dot_down --layers 4 --window -1 --ttt-params down
+--name L4_none_mse_both --layers 4 --window -1 --ttt-loss mse
+--name L4_none_mse_down --layers 4 --window -1 --ttt-loss mse --ttt-params down
+--name L4_none_read_both --layers 4 --window -1 --ttt-order rw --ttt-value read
+--name L4_none_read_down --layers 4 --window -1 --ttt-order rw --ttt-value read --ttt-params down

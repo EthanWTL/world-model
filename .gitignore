@@ -1,0 +1,24 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# debug / job outputs
+*.out
+*.err
+*.log
+slurm-*
+wandb/
+outputs/
+
+# checkpoints / data / media
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.npy
+*.npz
+*.mp4
+*.gif
+
+# personal notes (not code)
+doc/

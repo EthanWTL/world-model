@@ -1,0 +1,11 @@
+--name L4_w1_mse_down_f0.25 --layers 4 --ttt-loss mse --ttt-params down --ttt-fast-frac 0.25 --seed 1
+--name L4_w1_mse_down_f0.25 --layers 4 --ttt-loss mse --ttt-params down --ttt-fast-frac 0.25 --seed 2
+--name L4_w1_mse_down_first2 --layers 4 --ttt-loss mse --ttt-params down --ttt-layers 0,1 --seed 1
+--name L4_w1_mse_down_first2 --layers 4 --ttt-loss mse --ttt-params down --ttt-layers 0,1 --seed 2
+--name L4_w1_mse_down_f0.125 --layers 4 --ttt-loss mse --ttt-params down --ttt-fast-frac 0.125
+--name L4_w1_mse_down_first2_f0.25 --layers 4 --ttt-loss mse --ttt-params down --ttt-layers 0,1 --ttt-fast-frac 0.25
+--name L4_w1_mse_down_first2_f0.25_h4 --layers 4 --ttt-loss mse --ttt-params down --ttt-layers 0,1 --ttt-fast-frac 0.25 --ttt-heads 4
+--name L4_w1_mse_down_only1 --layers 4 --ttt-loss mse --ttt-params down --ttt-layers 1
+--name L4_w1_dot_both_first2 --layers 4 --ttt-layers 0,1
+--name L12_w1_mse_down_first4 --layers 12 --ttt-loss mse --ttt-params down --ttt-layers 0,1,2,3
+--name L12_w1_mse_down --layers 12 --ttt-loss mse --ttt-params down

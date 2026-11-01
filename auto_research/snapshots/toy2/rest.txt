@@ -1,0 +1,12 @@
+--name L4_w1_dot_both --layers 4 --ttt-params both
+--name L4_w1_dot_up --layers 4 --ttt-params up
+--name L4_w1_dot_down --layers 4 --ttt-params down
+--name L4_w1_mse_both --layers 4 --ttt-loss mse
+--name L4_w1_mse_down --layers 4 --ttt-loss mse --ttt-params down
+--name L4_w1_read_both --layers 4 --ttt-order rw --ttt-value read
+--name L4_w1_read_down --layers 4 --ttt-order rw --ttt-value read --ttt-params down
+--name L4_w1_dot_both_h4 --layers 4 --ttt-heads 4
+--name L12_w1_ctrl --layers 12 --ttt-layers none
+--name L12_w1_dot_down --layers 12 --ttt-params down
+--name L12_w1_dot_both --layers 12 --ttt-params both
+--name L12_w1_mse_both --layers 12 --ttt-loss mse

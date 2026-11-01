@@ -1,0 +1,11 @@
+--name L4_w1_mse_both --layers 4 --ttt-loss mse --seed 1
+--name L4_w1_mse_both --layers 4 --ttt-loss mse --seed 2
+--name L4_none_mse_both --layers 4 --window -1 --ttt-loss mse --seed 1
+--name L4_none_mse_both --layers 4 --window -1 --ttt-loss mse --seed 2
+--name L4_none_dot_up --layers 4 --window -1 --ttt-params up --seed 1
+--name L4_none_dot_up --layers 4 --window -1 --ttt-params up --seed 2
+--name L4_w1_dot_down --layers 4 --ttt-params down --seed 1
+--name L4_w1_dot_down --layers 4 --ttt-params down --seed 2
+--name L4_w1_dot_both --layers 4 --ttt-params both --seed 1
+--name L4_w1_dot_both --layers 4 --ttt-params both --seed 2
+--name L4_w1_ctrl --layers 4 --ttt-layers none --seed 1

@@ -1,0 +1,9 @@
+--name L4_w1_dot_both_f0.25_h4 --layers 4 --ttt-fast-frac 0.25 --ttt-heads 4
+--name L4_none_mse_both_f0.5 --layers 4 --window -1 --ttt-loss mse --ttt-fast-frac 0.5
+--name L4_none_mse_both_f0.5_h4 --layers 4 --window -1 --ttt-loss mse --ttt-fast-frac 0.5 --ttt-heads 4
+--name L4_none_mse_down_f0.5_h4 --layers 4 --window -1 --ttt-loss mse --ttt-params down --ttt-fast-frac 0.5 --ttt-heads 4
+--name L4_none_mse_up --layers 4 --window -1 --ttt-loss mse --ttt-params up
+--name L4_w1_mse_down_last2 --layers 4 --ttt-loss mse --ttt-params down --ttt-layers last2
+--name L4_w1_mse_down_first2 --layers 4 --ttt-loss mse --ttt-params down --ttt-layers 0,1
+--name L4_w1_mse_down_only3 --layers 4 --ttt-loss mse --ttt-params down --ttt-layers 3
+--name L4_w1_mse_down_only0 --layers 4 --ttt-loss mse --ttt-params down --ttt-layers 0
