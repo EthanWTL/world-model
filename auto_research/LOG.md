@@ -528,3 +528,172 @@ Multi-seed (in progress): wf_c0_s1 / wf_c0_s2 (the c0 stage) also jump around st
 - Averaged over 3 seeds, before and after the warm start are **essentially the same**.
 - What the warm start buys is **keeping attention while the memory loses nothing**; it does not make tracking stronger.
 - Against LaCT8 (1.00/1.00/.98/.69): our 3-seed mean is comparable at N30 (.72) and lower at N20 (.89).
+
+## Wave G (submitted 2026-10-31 night): the three papers' recipes inside our training recipe + loss-only comparison
+
+All runs: c0 + curriculum, 6000 steps from ema_160000, followed automatically by the thorough eval (EMA, 64 episodes, 50 steps, n05–n30, tf + free). Code frozen in `snapshots/wg`; commands in `waves/wg.sh`.
+
+| run | what it tests |
+|---|---|
+| wg_inplace | In-Place TTT as published: dot, down only, next-frame value, read-then-write, no renorm, every 6th layer (5, 11) |
+| wg_inplace_all | same, but all 12 layers |
+| wg_lact | LaCT8 shape carved out of the native FFN: dot, both, f0.5 + 8 heads (144×288 per head), renorm, write-then-read |
+| wg_e2e | TTT-E2E: diffusion loss as the inner loss, both, last 3 layers (1/4), half the units frozen (= its static MLP), no renorm |
+| wg_dot_down_f025h8 | **loss only**: dot instead of delta; everything else = best config |
+| wg_dot_both_f025h8 | **loss only**: dot + both (the paper's way to get a self-path) |
+| wg_e2e_f025h8 | **loss only**: TTT-E2E's loss; everything else = best config (B200, accum 4) |
+| wg_f025h1 | fallback without heads |
+| wg_f1h8 | heads without fallback |
+
+Why the earlier paper-style runs don't count: they all used SWA1 (wc_dot_down_c1, wc_dot_both_c1, wc_e2e_last3_c1, …) and stalled at the relay level (final quick eval curr3 ≈ .6, n05 at chance), exactly like our own delta rule under SWA1 (wc_mse_down_c1). That is pitfall 15, not the loss. `wc_dot_up_c0` (the only paper-style c0 run) ended at curr3 .41, n05 .31, n10/n20 at chance (quick eval).
+
+### Analysis B: a swap is a reflection, and only the delta rule writes reflections
+
+- Swapping cups i and j is the permutation P = I − (e_i − e_j)(e_i − e_j)ᵀ = I − 2k̂k̂ᵀ with k̂ = (e_i − e_j)/√2: a Householder reflection.
+- If the memory M maps cup keys to "ball here?", a swap needs M_new = M_old·P = M_old − 2(M_old k̂)k̂ᵀ. The update has to **subtract what the old memory answers along the swap direction**.
+- Delta rule on down: ΔW2_new = ΔW2(I − η·h hᵀ) + η·v hᵀ. With v = 0, h ∝ k̂ and η‖h‖² = 2, this is exactly M_old·P. One write = one swap.
+- Dot: ΔW2_new = ΔW2 + η·v hᵀ. The old memory is multiplied by I, so it can only accumulate. To swap, v would have to equal −(2/η)·M_old k̂, which needs a read of the old memory. Our `read` variant does exactly that (toy none read_down: 1.00/.98/.76), and LaCT gets it through the input-side update, whose gradient passes through the current W and activation. The paper's "W1 only" (readout only, 1.00/.14/.30/.16) and "1-layer MLP" (1.00/.23/.23/.13) have no such path and fail.
+- This matches the linear-RNN literature: DeltaNet's transition I − βkkᵀ with β up to 2 has negative eigenvalues, which is what makes state tracking possible.
+- The paper's MSE (.22/.16/.22/.22) fits the whole fast output to v, so the error is nonzero from the start. Ours fits only the increment (fast − slow), so the memory starts empty and the error term is exactly "old memory's answer − v".
+- Not yet checked: whether the learned η‖h‖² is near 2 at swap chunks.
+- **The paper's own baselines confirm Analysis B.** Standard GDN/KDA (delta rule with β ∈ [0,1], so eigenvalues 1−β ∈ [0,1]: they can only shrink the old value, never flip it) fit N=5 and fall to chance at N≥10. GDN-neg/KDA-neg (β ∈ [0,2], eigenvalues in [−1,1]) extrapolate; **GDN-neg reaches .95 at N30, the best model in the paper** (LaCT8 .69). The additive scratchpad control also fails by N20 (its memory norm keeps growing).
+- Our η is an unbounded softplus and the keys are not normalized, so the effective β along a direction, (1/T)Σ_t η_t (h_t·k̂)², can exceed 1: our delta rule is in the "-neg" regime. Bounding β to [0,2] per token would *not* reproduce GDN-neg here, because we average one gradient step over the 960 tokens of a chunk (a sum of rank-1 terms, not a product of per-token Householders); a reflection along k̂ would then need every token aligned with k̂.
+- So the dividing line is not "delta vs dot" or "in-place vs separate branch" but **whether the update can express a swap**: delta with β up to 2 (direct), nonlinear fast weights (LaCT, indirect), or a value that reads the old memory (our `read` variant).
+
+### e2e (the general loss): why it has not been tested yet, and how wave G tests it
+- The two earlier e2e runs can't separate "the loss is bad" from "the setting is bad":
+  - e2e_both_last3 (wave 1): N=5 only, no curriculum, SWA1, stopped at ~1100 steps. Without a curriculum nothing learns (ctrl and dot_up_all stayed at chance for 6000 steps).
+  - wc_e2e_last3_c1: curriculum, but SWA1 → the relay shortcut (curr3 .59, n05 at chance), the same as wc_mse_down_c1 (curr3 .50, n05 at chance).
+- e2e never got c0 + curriculum + fallback/heads + all layers, which is what made the delta rule work.
+
+| run | layers | params | structure | inner σ | question |
+|---|---|---|---|---|---|
+| wg_e2e | last3 | both | f0.5, 1 head, no renorm | random (shift 3, median .75) | TTT-E2E as published |
+| wg_e2e_s1 | last3 | both | same | 1.0 | does a memory-only inner loss help? |
+| wg_e2e_f025h8 | all | down | f0.25+h8 (= best config) | random | loss only |
+| wg_e2e_both_f025h8 | all | both | f0.25+h8 | random | e2e needs both? |
+
+**Hypothesis (to test):**
+- On a swap chunk the cups are identical, the ball is hidden and the motion is given by the action. So the chunk can be predicted without any memory, and the inner diffusion loss does not depend on the ball. The e2e gradient therefore lives in "visible error" directions.
+- e2e on down only adds visible-error values and cannot move a stored ball value. Updating up changes the keys, which can re-address what is stored.
+- The delta rule avoids this problem: it multiplies the old memory by (I − η·h hᵀ), so a swap defined by visible keys is applied blindly to whatever is stored, including the hidden ball.
+- Prediction: e2e down fails at N≥10; e2e both has a chance; σ=1 makes the inner loss as memory-dependent as it can be.
+
+## Wave H (submitted 2026-11-01 early): memory in the attention q/k/v projections
+
+Code: `AttnWriter` in wm.py; `--ttt-attn {q,k,v,qkv}`, and `--ttt-params none` keeps the FFN slow. check.py [2] (zero init is exactly 0 for qkv / v, also combined with the FFN) and [5] (hand-written gradient vs autograd, 1e-7).
+- **Fast part:** the q/k/v output channels of the last f·16 attention heads (f0.25 = heads 12–15). The first heads are the fallback. `--ttt-heads 4` = block-diagonal inside the fast part, aligned to attention heads (each fast head writes from 1/4 of the input).
+- **Target per projection:** t_P = T_P·a (zero-init) = "where this chunk wants P to move"; ΔW_P·a = how far TTT has already moved P for this input.
+  - delta: ℓ = ½‖ΔW_P·a − t_P‖² → ΔW_P ← ΔW_P(I − η·a aᵀ) + η·t_P aᵀ. This is the same Householder form as the FFN delta rule, so it can express swaps.
+  - dot: ΔW_P ← ΔW_P + η·t_P aᵀ (only accumulates).
+- **e2e on q/k:** second-order gradients through RMSNorm + softmax are far spikier than on the FFN. At inner lr 10, gn reached 3e6 by step 4; with init 1 it stays at ≈2–20 (clipped at 1). lr is still learnable.
+- **Pre-existing, not a bug:** FFN partial-fast mse configs differ from no-TTT by ~2.5e-4 at zero init.
+  - Cause: ffn_apply sums the slow and fast halves of down separately (summation order), and the difference is amplified through 12 layers × 7 chunks. The old code gives the same number.
+  - The attention path concatenates channels instead, so its difference is exactly 0.
+
+| run | projection | loss | structure | question |
+|---|---|---|---|---|
+| wh_v / wh_k / wh_q / wh_qkv | v / k / q / qkv | delta | f0.25 + h4 | which projection can hold the state |
+| wh_v_dot / wh_qkv_dot | v / qkv | dot | f0.25 + h4 | loss |
+| wh_qkv_e2e | qkv | e2e (inner lr 1, accum 4) | f0.25 + h4 | loss |
+| wh_v_f1 / wh_qkv_f1 | v / qkv | delta | all heads fast, no mask | fallback + heads |
+
+All runs: c0 + curriculum, all 12 layers, 6000 steps, chained thorough eval.
+
+Predictions:
+- v + delta ≈ FFN down + delta. Same algebra (a linear associative memory keyed by the attention input), and the content enters the output directly.
+- q/k + delta: the memory only changes routing inside the chunk (c0), so attention has to turn "which slot" into content. Expect it to be slower or weaker.
+- dot fails, as on the FFN.
+- f1 is worse than f0.25 + h4.
+- e2e is uncertain.
+
+Wave G interim (quick eval, raw weights): wg_inplace at step 5000 reaches curr3 .56 / n05 .47 / n10 .16 / n20 .00. It learns the training length and does not extrapolate, as predicted.
+
+### Wave G results (EMA at step 6000, 64 episodes, 50 steps)
+
+| run | free N5/10/20/30 | tf N5/10/20/30 |
+|---|---|---|
+| **best (delta, down, f0.25+h8), 3 seeds** | **1.00/.99/.88/.71** | – |
+| wg_inplace (In-Place as published, layers 5,11) | .38/.14/.22/.03 | .38/.20/.00/.00 |
+| wg_inplace_all | .23/.19/.16/.11 | .23/.09/.22/.19 |
+| wg_lact (LaCT8 shape) | .23/.11/.22/.12 | .28/.00/.22/.16 |
+| wg_e2e (TTT-E2E as published) | .09/.25/.22/.17 | .19/.27/.23/.25 |
+| wg_e2e_s1 (σ=1) | .17/.25/.19/.25 | .23/.16/.17/.27 |
+| wg_dot_down_f025h8 (loss only) | .22/.17/.22/.25 | .23/.22/.17/.20 |
+| wg_dot_both_f025h8 (loss only) | .27/.17/.14/.11 | .23/.23/.22/.17 |
+| wg_e2e_f025h8 (loss only) | .19/.14/.22/.19 | .20/.20/.17/.20 |
+| wg_e2e_both_f025h8 | .17/.16/.22/.20 | .23/.19/.17/.19 |
+| wg_f025h1 (fallback, no heads) | 1.00/.95/.33/.22 | 1.00/.78/.19/.20 |
+| wg_f1h8 (heads, no fallback) | 1.00/.97/.09/.08 | 1.00/.88/.14/.19 |
+| wc_mse_down_c0 (neither) | .97/.56/.17/.14 | 1.00/.77/.11/.12 |
+
+1. **Every paper recipe fails in our setting, mostly already at N5.** In-Place as published is the only one above chance at N5 (.38).
+2. **The loss alone decides it.** With the best structure held fixed, dot (down or both) and e2e (down or both) are at chance even at N5. Only the delta rule learns.
+3. **e2e is flat at exactly p = .20 in all 5 variants for 6000 steps.** The inner lr did not collapse (it ends at 5–10, or 0.5 for qkv), so e2e writes something, just nothing useful. This is consistent with the observability hypothesis: the inner loss of a swap chunk does not depend on the ball.
+4. **Fallback vs heads (delta, down):** either one alone fixes N10 (.56 → .95 / .97), but N20+ needs both (.33 / .09 alone vs .88 together).
+5. The dot runs were still rising slowly at 6000 (curr3 p .3–.5, no jump), so they are continued to 12000 for a fair comparison (wave H2).
+
+### Wave H results at step 6000 — the attention memory learns, but late
+
+| run | EMA free N5/10/20/30 | raw weights at 6000, quick eval (curr3 / n05) |
+|---|---|---|
+| wh_v | .25/.12/.09/.17 | .94 / .69 |
+| wh_k | .38/.19/.19/.30 | .91 / .84 |
+| wh_q | .36/.19/.19/.23 | .78 / .72 |
+| wh_qkv | .75/.44/.06/.16 | .94 / .91 |
+| wh_v_f1 | .69/.23/.09/.20 | 1.00 / 1.00 |
+| wh_qkv_f1 | .28/.14/.22/.16 | .47 / .22 |
+| wh_v_dot / wh_qkv_dot | .25 / .30 at N5 | no jump (curr3 p .34 at most) |
+| wh_qkv_e2e | chance | chance |
+
+- **Pitfall 17:** every attention delta run jumps at step 5000–6000, much later than the FFN (2500). EMA 0.999 averages over ~1000 steps, so at step 6000 it still mostly holds pre-jump weights, and the EMA eval badly understates these runs.
+- Fix: continue the same runs to 12000 steps (`waves/wh2.sh`, resumed from last.pt with a constant lr) and evaluate ckpt_012000.
+- Even q alone or k alone (routing only) learns the training length.
+
+### Wave H2: attention memory at 12000 steps (EMA, thorough) — q / k extrapolate further than anything so far
+
+| run | free N5/10/20/30 | tf N5/10/20/30 |
+|---|---|---|
+| **wh_q** (delta, q only, f0.25+h4) | **.98/1.00/.97/.91** | 1.00/1.00/.97/.92 |
+| **wh_k** (delta, k only) | **.97/1.00/.97/.88** | 1.00/1.00/.98/.83 |
+| wh_v (delta, v only) | 1.00/.97/.11/.02 | 1.00/.97/.19/.11 |
+| FFN best (delta, down, f0.25+h8), 6000 steps, 3 seeds | 1.00/.99/.88/.71 | – |
+| paper LaCT8 (from scratch, 200K) | 1.00/1.00/.98/.69 | – |
+
+- **Memory in the routing (q or k alone) beats memory in the content (v, FFN down) by a wide margin at N30.** These are single seeds, with twice the FFN's step budget.
+- Hypothesis (unverified): q and k pass through RMSNorm and then softmax, so a read is normalized and selective (a soft argmax over tokens), and small write errors get cleaned up at every step. v and FFN down add content linearly, so errors accumulate over many swaps.
+- The other 12k evals (qkv, f1, dot) are running locally on GPUs 6/7 (Slurm duplicates cancelled).
+
+## Wave I (submitted 2026-11-01 evening)
+
+| run | what |
+|---|---|
+| wi_ffn_key | FFN best + `--ttt-key proj` (write key k = u + W_k·u, W_k zero-init, read unchanged), 6000 steps |
+| wi_q_key | attention q + `--ttt-key proj`, 12000 steps |
+| wi_ffn_12k | FFN best continued 6000 → 12000 (equal budget to the attention runs) |
+| wi_q_s1 / wi_q_s2 / wi_k_s1 | seeds for the q / k results |
+
+**Why `--ttt-key proj` (the user's question about LaCT's "k predicts v"):**
+- Our writes have always used k = the layer's own input (u or a), with v = a zero-init projection. LaCT uses separate learned k / q / v projections (with RoPE): write with k, read with q.
+- In our setting, writes see the clean chunk at σ=0, while reads see the noisy next chunk (different σ, and a different time-embedding scale/shift on u). With k = u, write and read addresses match only to the extent that clean and noisy features happen to agree. A learned k can move the write address toward what the next chunk's queries will look like.
+- The read path (the native forward) is untouched; only where the memory writes changes. Swapping the read input as well would change the native computation, so that was not done.
+- check.py [2]: zero init still matches key=self (exactly 0 on the attention path). [6]: hand-written gradient vs autograd agree to 1e-7.
+
+### Wave H2, more 12k results: any fast v blows up beyond the training length
+
+| run | free N5/10/20/30 | tf N5/10/20/30 | σ=1 x0 MSE (tf_mse1) N5/10/20/30 |
+|---|---|---|---|
+| wh_q | .98/1.00/.97/.91 | 1.00/1.00/.97/.92 | .0003/.0016/.0008/.0023 |
+| wh_k | .97/1.00/.97/.88 | 1.00/1.00/.98/.83 | .0003/.0014/.0008/.0029 |
+| wh_v | 1.00/.97/.11/.02 | 1.00/.97/.19/.11 | .0001/.0014/**.0927/.1297** |
+| wh_qkv | 1.00/.98/.00/.16 | 1.00/1.00/.02/.00 | .0003/.0013/**.0355/.0529** |
+| wh_qkv_f1 | 1.00/.94/.22/.12 | 1.00/.94/.12/.19 | .0002/.0019/**.2035/1.114** |
+| FFN best (6000) | 1.00/1.00/.88/.78 | 1.00/.98/.94/.72 | .0003/.0011/.0013/.0029 |
+
+**Pitfall 18: making v fast breaks generation beyond the training length.**
+- Every run with a fast v keeps a normal x0 error up to N10, then it jumps 30–1000× at N20/N30. The frames break and the ball can't be detected, which is why some accuracies come out as 0.
+- q / k pass through RMSNorm (over all 1152 channels) before the softmax, so whatever the memory writes is rescaled to a bounded size. v goes straight into the output with no normalization, so its drift grows without bound.
+- Adding v to q/k (wh_qkv) inherits v's failure.
+- **Recommendation: put the memory in q or k only.**
+
+Caveat on the fallback for q/k: that RMSNorm is over the whole 1152-dim q (or k), not per head. The fast heads therefore change each token's RMS and rescale the fallback heads' q/k by a common factor, so the q/k fallback is not perfectly isolated (v's fallback is).

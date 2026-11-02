@@ -30,10 +30,12 @@ def get_args(argv=None):
     ap.add_argument("--init", default=None)  # 从一个微调过的 TTT checkpoint 接着训（结构要一样），用它的 ema
     ap.add_argument("--max-ctx", type=int, default=1)
     ap.add_argument("--ttt-layers", default="none")   # none / all / last3 / first3 / 0,4,8
-    ap.add_argument("--ttt-params", default="both", choices=["up", "down", "both"])
+    ap.add_argument("--ttt-params", default="both", choices=["up", "down", "both", "none"])
+    ap.add_argument("--ttt-attn", default="")  # 注意力的哪些投影做 fast weight："v" / "qkv" / ...（空 = 不做）
     ap.add_argument("--ttt-loss", default="dot", choices=["dot", "mse", "e2e"])
     ap.add_argument("--ttt-value", default="self", choices=["self", "next", "read"])
     ap.add_argument("--ttt-order", default="wr", choices=["wr", "rw"])
+    ap.add_argument("--ttt-key", default="self", choices=["self", "proj"])  # proj：写入的 key = x + W_k·x（可学）
     ap.add_argument("--ttt-lr", type=float, default=1e-3)
     ap.add_argument("--ttt-norm", type=int, default=1)
     ap.add_argument("--ttt-v-init", type=float, default=0.0)
@@ -103,7 +105,9 @@ def fw_stats(model, st):
     out = {}
     for i in model.ttt.layers:
         blk = model.blocks[i]
-        for name, W, ref in (("up", st.W1[i], blk.ffn[0].weight[blk.ns:]), ("down", st.W2[i], blk.ffn[2].weight[:, blk.ns:])):
+        mats = [("up", st.W1[i], blk.ffn[0].weight[blk.ns:]), ("down", st.W2[i], blk.ffn[2].weight[:, blk.ns:])]
+        mats += [(p, st.Wa[i].get(p), getattr(blk.self_attn, p).weight[blk.na:]) for p in model.ttt.attn]
+        for name, W, ref in mats:
             if W is not None and W.dim() == 3:
                 out[f"dW_{name}_{i}"] = ((W.float() - ref.float()).norm(dim=(1, 2)) / ref.float().norm()).mean().item()
     return out
@@ -118,7 +122,7 @@ def build(args):
     ema = copy.deepcopy(model).requires_grad_(False).eval()
     # 三组：Linear 的权重矩阵走 NorMuon；inner lr 的参数（FastWriter.lr、e2e_lr）单独一组 AdamW，lr 大一些
     # （它们在 softplus 里，AdamW 每步只挪 ~lr，用 1e-4 的话要几万步 inner lr 才变得动）；其余 AdamW
-    lr_params = [p for n, p in model.named_parameters() if ".ttt.lr." in n or n == "e2e_lr"]
+    lr_params = [p for n, p in model.named_parameters() if ".ttt.lr." in n or ".ttt_attn.lr." in n or n == "e2e_lr"]
     lr_ids = {id(p) for p in lr_params}
     mats = [m.weight for m in model.modules() if isinstance(m, nn.Linear) and id(m.weight) not in lr_ids]
     ids = {id(w) for w in mats} | lr_ids
@@ -256,7 +260,7 @@ def main():
                     d.update({f"probe_acc_c{c + 1}": v for c, v in enumerate(acc.tolist())})
             if hist[0][4] is not None:
                 d["probe_ce"] = sum(h[4] for h in hist if h[4] is not None) / len(hist)
-            for name in ("up", "down"):
+            for name in ("up", "down", "q", "k", "v"):
                 vals = [v for k, v in fw.items() if k.startswith(f"dW_{name}_")]
                 if vals:
                     d[f"dW_{name}_mean"] = sum(vals) / len(vals)
@@ -265,7 +269,9 @@ def main():
                 d["e2e_lr_mean"] = torch.nn.functional.softplus(model.e2e_lr.detach().float())[list(model.ttt.layers)].mean().item()
             pa = " ".join(f"{k[10:]}:{d[k]:.2f}" for k in sorted(d) if k.startswith("probe_acc_n"))
             print(f"step {step} | loss {d['loss']:.4f} | last {d['loss_last']:.4f} | gn {d['grad_norm']:.2f} | "
-                  f"dW up {d.get('dW_up_mean', 0):.2e} down {d.get('dW_down_mean', 0):.2e} | probe {pa} | "
+                  f"dW up {d.get('dW_up_mean', 0):.2e} down {d.get('dW_down_mean', 0):.2e} "
+                  + "".join(f"{p} {d[f'dW_{p}_mean']:.2e} " for p in model.ttt.attn if f"dW_{p}_mean" in d)
+                  + f"| probe {pa} | "
                   f"{dt:.2f} s/step | {d['mem_gb']:.0f} GB", flush=True)
             record(d)
             hist, t0 = [], time.time()

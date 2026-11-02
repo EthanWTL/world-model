@@ -5,6 +5,7 @@
 #   2. RoPE 用 float32 的 cos/sin（原版 float64 复数，A6000/A40 上 FP64 很慢）；角度还是 float64 算的
 #   3. TTT：选中的 block 把 FFN 的 up（W1: 1152->4608）和/或 down（W2: 4608->1152）当成每个样本自己的 fast weight，
 #      commit 干净 chunk 时按 inner loss 走一步梯度；denoise 只读不写
+#   4. 也可以把注意力的 q/k/v 投影当 fast weight（AttnWriter）：后面几个 head 的输出通道 fast，前面的兜底
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -19,17 +20,21 @@ from torch.utils.checkpoint import checkpoint
 @dataclass
 class TTTConfig:
     layers: tuple = ()      # 哪些 block 做 TTT（空 = 不做）
-    params: str = "both"    # 更新哪个矩阵：up / down / both
+    params: str = "both"    # 更新 FFN 的哪个矩阵：up / down / both / none
+    attn: str = ""          # 更新注意力的哪些投影："q"/"k"/"v" 的任意组合（如 "v"、"qkv"）；空 = 不更新
     loss: str = "dot"       # dot: ℓ = -<f(u), v>（LaCT）；mse: ℓ = ½|f(u) - f_slow(u) - v|²（delta rule）；e2e: 扩散 loss 本身
     value: str = "self"     # v 从哪来：self = Wv·u_t；next = Wv·u（下一个 latent 帧同一位置，In-Place TTT 的"对齐下一个 token"）
                             # read = Wv·u_t + Wr·y_old（这一层用旧权重读出来的 FFN 输出，要 order=rw）：写依赖自己的读 = 显式 self-path
     order: str = "wr"       # wr: 先写后读（LaCT）；rw: 先读后写（In-Place）
+    key: str = "self"       # 写入用的 key：self = 这一层自己的输入（FFN 的 u / 注意力的 a）；
+                            # proj = x + W_k·x（W_k 零初始化，只用来写，读还是原生前向）= LaCT 的"用 k 预测 v"
     lr: float = 1e-3        # inner lr 初值（softplus 参数化；dot/mse 每个 token 一个，e2e 每层一个标量）
     norm: bool = True       # 每次更新后把每一行的范数拉回 slow weight 的（LaCT 的 weight norm）
     v_init: float = 0.0     # Wv 的初始化 std；0 = 零初始化，一开始什么都不写，模型和 base 完全一样
     e2e_sigma: float = -1.0  # e2e 的 inner loss 用的 σ；<0 = 每次随机抽（和训练一样，shift 3）
     heads: int = 1          # >1：fast 部分的更新只保留块对角（输入 D/H 一段 <-> fast hidden 的 1/H 一段），像 LaCT 的多头
     fast_frac: float = 1.0  # FFN hidden 单元里做 fast 的比例；前面其余的单元永远是 slow（兜底：base 的能力写不坏）
+                            # 注意力也用它：q/k/v 输出通道里 fast 的比例（取 heads 的倍数，0.25 = 16 个 head 里后 4 个）
 
 
 def inv_softplus(y):
@@ -68,6 +73,14 @@ def ffn_apply(up, down, u, W1, W2, ns=0):
         return down(h)
     yf = torch.matmul(h[..., ns:], W2.mT)
     return (F.linear(h[..., :ns], down.weight[:, :ns], down.bias) if ns else down.bias) + yf
+
+
+def proj_apply(lin, x, W, ns=0):
+    # 注意力的 q/k/v 投影：前 ns 个输出通道用共享的 slow weight，后面的用每个样本自己的 W [B, D-ns, D]（None = slow）
+    if W is None:
+        return lin(x)
+    yf = torch.matmul(x, W.mT) + lin.bias[ns:]
+    return torch.cat([F.linear(x, lin.weight[:ns], lin.bias[:ns]), yf], -1) if ns else yf
 
 
 def renorm(W, ref):
@@ -113,13 +126,15 @@ class SelfAttention(nn.Module):
         self.q, self.k, self.v, self.o = (nn.Linear(dim, dim) for _ in range(4))
         self.norm_q, self.norm_k = RMSNorm(dim, eps), RMSNorm(dim, eps)
 
-    def forward(self, x, cos, sin, ck, cv):
+    def forward(self, x, cos, sin, ck, cv, Wa=None, ns=0):
         # x: [B, L, D]；ck/cv: 窗口里缓存的 K/V [B, n, Lc, d]（None = 没有上下文）
+        # Wa: {"q"/"k"/"v": 每个样本自己的 fast 输出通道 [B, D-ns, D]}，没有的投影用 slow weight
         b, L, _ = x.shape
         n, d = self.num_heads, self.head_dim
-        q = rope(self.norm_q(self.q(x)).view(b, L, n, d), cos, sin).transpose(1, 2)
-        k = rope(self.norm_k(self.k(x)).view(b, L, n, d), cos, sin).transpose(1, 2)
-        v = self.v(x).view(b, L, n, d).transpose(1, 2)
+        Wa = Wa or {}
+        q = rope(self.norm_q(proj_apply(self.q, x, Wa.get("q"), ns)).view(b, L, n, d), cos, sin).transpose(1, 2)
+        k = rope(self.norm_k(proj_apply(self.k, x, Wa.get("k"), ns)).view(b, L, n, d), cos, sin).transpose(1, 2)
+        v = proj_apply(self.v, x, Wa.get("v"), ns).view(b, L, n, d).transpose(1, 2)
         K = k if ck is None else torch.cat([ck, k], 2)
         V = v if cv is None else torch.cat([cv, v], 2)
         out = F.scaled_dot_product_attention(q, K, V)
@@ -141,6 +156,9 @@ class FastWriter(nn.Module):
             assert cfg.order == "rw", "value=read 要先用旧权重读"
             self.r = nn.Linear(dim, dim, bias=False)  # 读出来的东西 -> 要写的值，零初始化
             nn.init.zeros_(self.r.weight)
+        if cfg.key == "proj":
+            self.k = nn.Linear(dim, dim, bias=False)  # 写入的 key = u + W_k·u，零初始化 = 一开始和 key=self 一样
+            nn.init.zeros_(self.k.weight)
         self.lr = nn.Linear(dim, 2)  # 每个 token 两个 lr（W1、W2 各一个）= softplus(W·u + b)，一开始全是 cfg.lr
         nn.init.zeros_(self.lr.weight)
         nn.init.constant_(self.lr.bias, inv_softplus(cfg.lr))
@@ -160,6 +178,8 @@ class FastWriter(nn.Module):
             v = v.unflatten(1, (5, -1))
             v = torch.cat([v[:, 1:], torch.zeros_like(v[:, :1])], 1).flatten(1, 2)
         eta = F.softplus(self.lr(u).float())                       # [B, T, 2]
+        if cfg.key == "proj":  # 下面的 key 都换成 u + W_k·u；v、lr 还是从 u 来
+            u = u + self.k(u)
         if cfg.loss == "dot":
             z = torch.matmul(u, W1c.mT) + b1                       # [B, T, Ff]，用更新前的 W1
             h = F.gelu(z, approximate="tanh")
@@ -194,6 +214,48 @@ class FastWriter(nn.Module):
         return new1, new2
 
 
+class AttnWriter(nn.Module):
+    """一个 block 的注意力 TTT 写入（dot / mse）：拿注意力的输入 a，对选中的 q/k/v 投影的 fast 输出通道走一步梯度
+    每个投影 P 有一个"这个 chunk 希望 P 往哪移"的目标 t_P = T_P·a（零初始化，一开始什么都不写）：
+      mse（delta rule）：ℓ = ½|ΔW_P·a - t_P|²，ΔW_P·a = TTT 到目前为止已经把 P 挪了多少，只补差的那部分
+      dot：ℓ = -<W_P·a, t_P>，不管已经挪了多少，每次都把 t_P 整个加上去"""
+
+    def __init__(self, dim, rows, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.t = nn.ModuleDict({p: nn.Linear(dim, rows, bias=False) for p in cfg.attn})
+        for m in self.t.values():
+            nn.init.zeros_(m.weight)
+        if cfg.key == "proj":
+            self.k = nn.Linear(dim, dim, bias=False)  # 写入的 key = a + W_k·a，零初始化
+            nn.init.zeros_(self.k.weight)
+        self.lr = nn.Linear(dim, len(cfg.attn))  # 每个 token 每个投影一个 lr = softplus(W·a + b)，一开始全是 cfg.lr
+        nn.init.zeros_(self.lr.weight)
+        nn.init.constant_(self.lr.bias, inv_softplus(cfg.lr))
+
+    def forward(self, a, Wa, attn, ns):
+        # a: [B, T, D]；Wa: {p: [B, D-ns, D]}（没有的 = 还是 slow）；attn: 这一层的 SelfAttention（拿 slow weight）
+        # 返回新的 Wa（没选中的投影原样带过去）
+        cfg = self.cfg
+        T = a.shape[1]
+        eta = F.softplus(self.lr(a).float())                                # [B, T, P]
+        ak = a + self.k(a) if cfg.key == "proj" else a                      # 写入用的 key
+        new = dict(Wa)
+        for j, p in enumerate(cfg.attn):
+            Ws, W = getattr(attn, p).weight[ns:], Wa.get(p)                  # fast 通道对应的 slow weight [D-ns, D]
+            t = self.t[p](a)
+            if cfg.loss == "dot":
+                g = -t
+            else:  # 按增量算 ΔW·k，不用两个 bf16 matmul 相减（坑 1）
+                g = (0 if W is None else torch.matmul(ak, (W - Ws).mT).float()) - t
+            G = torch.matmul((g.float() / T * eta[..., j:j + 1]).mT, ak)     # [B, D-ns, D]
+            if cfg.heads > 1:
+                G = G * head_mask(*G.shape[-2:], cfg.heads, G.device)
+            Wn = (Ws if W is None else W) - G
+            new[p] = renorm(Wn, Ws) if cfg.norm else Wn
+        return new
+
+
 class BallProbe(nn.Module):
     """从一个 chunk 最后一层的 token 特征读"球现在在几号杯子"：
     5 个杯子所在的列各自平均 -> 共享打分（局部特征：'球在我这儿'）+ 全局平均 -> 5 类（全局编码）"""
@@ -218,14 +280,22 @@ class Block(nn.Module):
         self.norm2 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(approximate='tanh'), nn.Linear(ffn_dim, dim))
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim ** 0.5)
-        self.ttt = None  # FastWriter（dot / mse 的层才有）
-        self.ns = 0      # 前 ns 个 FFN hidden 单元永远是 slow（TTT 层由 fast_frac 决定）
+        self.ttt = None       # FastWriter（dot / mse、更新 FFN 的层才有）
+        self.ttt_attn = None  # AttnWriter（dot / mse、更新 q/k/v 的层才有）
+        self.ns = 0           # 前 ns 个 FFN hidden 单元永远是 slow（TTT 层由 fast_frac 决定）
+        self.na = 0           # q/k/v 的前 na 个输出通道（前面的 head）永远是 slow
 
-    def forward(self, x, e, cos, sin, ck, cv, W1, W2, write):
+    def forward(self, x, e, cos, sin, ck, cv, W1, W2, Wa, write):
         # x: [B, T, D]；e: [B, 1, 6, D]；write = 这是 commit（干净 chunk），TTT 层要更新 fast weight
-        # 返回 (x, 这个 chunk 的 K, V, 新 W1, 新 W2)；W 没变就返回 None
+        # 返回 (x, 这个 chunk 的 K, V, 新 W1, 新 W2, 新 Wa)；没变就返回 None
         shift1, scale1, gate1, shift2, scale2, gate2 = (self.modulation.unsqueeze(0) + e).unbind(2)
-        a, k, v = self.self_attn(self.norm1(x) * (1 + scale1) + shift1, cos, sin, ck, cv)
+        xa = self.norm1(x) * (1 + scale1) + shift1
+        newa = None
+        if write and self.ttt_attn is not None and self.ttt_attn.cfg.order == "wr":
+            Wa = newa = self.ttt_attn(xa, Wa, self.self_attn, self.na)
+        a, k, v = self.self_attn(xa, cos, sin, ck, cv, Wa, self.na)
+        if write and self.ttt_attn is not None and self.ttt_attn.cfg.order == "rw":
+            newa = self.ttt_attn(xa, Wa, self.self_attn, self.na)
         x = x + a * gate1
         u = self.norm2(x) * (1 + scale2) + shift2
         new1 = new2 = None
@@ -235,7 +305,7 @@ class Block(nn.Module):
         y = ffn_apply(self.ffn[0], self.ffn[2], u, W1, W2, self.ns)
         if write and self.ttt is not None and self.ttt.cfg.order == "rw":
             new1, new2 = self.ttt(u, W1, W2, self.ffn[0], self.ffn[2], self.ns, y)
-        return x + y * gate2, k, v, new1, new2
+        return x + y * gate2, k, v, new1, new2, newa
 
 
 class Head(nn.Module):
@@ -258,6 +328,7 @@ class State:
         self.v = [[] for _ in range(n_layers)]
         self.W1 = [None] * n_layers
         self.W2 = [None] * n_layers
+        self.Wa = [{} for _ in range(n_layers)]  # 注意力的 fast weight：{"q"/"k"/"v": [B, D-na, D]}
         self.start = 0
 
     def replace(self, **kw):
@@ -266,12 +337,12 @@ class State:
         s.__dict__.update(kw)
         return s
 
-    def push(self, ks, vs, W1, W2, max_ctx, frames):
+    def push(self, ks, vs, W1, W2, Wa, max_ctx, frames):
         # commit 完：每层把这个 chunk 的 K/V 放进窗口，只留最近 max_ctx 个（None = 全留，0 = 不留）
         # 注意 max(·, 0)：l[len(l) - max_ctx:] 在 len(l) < max_ctx 时是负下标，会只留最后几个（这个 bug 让 max_ctx=7 卡在 3）
         keep = (lambda l: l) if max_ctx is None else (lambda l: l[max(len(l) - max_ctx, 0):] if max_ctx else [])
         return self.replace(k=[keep(o + [k]) for o, k in zip(self.k, ks)], v=[keep(o + [v]) for o, v in zip(self.v, vs)],
-                            W1=W1, W2=W2, start=self.start + frames)
+                            W1=W1, W2=W2, Wa=Wa, start=self.start + frames)
 
 
 class WanTTT(nn.Module):
@@ -292,11 +363,16 @@ class WanTTT(nn.Module):
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
         for i in ttt.layers:
             self.blocks[i].ns = n_slow_units(ffn_dim, ttt)
-        if ttt.loss == "e2e":  # e2e：每层每个矩阵一个可学的标量 lr
-            self.e2e_lr = nn.Parameter(torch.full((num_layers, 2), inv_softplus(ttt.lr)))
+            if ttt.attn:
+                self.blocks[i].na = n_slow_units(dim, ttt)
+        if ttt.loss == "e2e":  # e2e：每层每个矩阵一个可学的标量 lr（up、down，再加选中的 q/k/v）
+            self.e2e_lr = nn.Parameter(torch.full((num_layers, 2 + len(ttt.attn)), inv_softplus(ttt.lr)))
         else:
             for i in ttt.layers:
-                self.blocks[i].ttt = FastWriter(dim, ttt)
+                if ttt.params != "none":
+                    self.blocks[i].ttt = FastWriter(dim, ttt)
+                if ttt.attn:
+                    self.blocks[i].ttt_attn = AttnWriter(dim, dim - self.blocks[i].na, ttt)
 
     def rope_tables(self, start, grid):
         f, h, w = grid
@@ -323,7 +399,7 @@ class WanTTT(nn.Module):
         e = (e + self.action_proj(self.action_embedding(a)))[:, None]                    # [B, 1, D]：整个 chunk 共用
         e0 = self.time_projection(e).unflatten(2, (6, self.dim))                         # [B, 1, 6, D]
         cos, sin = self.rope_tables(state.start, grid)
-        ks, vs, W1s, W2s = [], [], list(state.W1), list(state.W2)
+        ks, vs, W1s, W2s, Was = [], [], list(state.W1), list(state.W2), list(state.Wa)
         for i, blk in enumerate(self.blocks):
             ck = (torch.cat(state.k[i], 2) if len(state.k[i]) > 1 else state.k[i][0]) if state.k[i] else None
             cv = (torch.cat(state.v[i], 2) if len(state.v[i]) > 1 else state.v[i][0]) if state.v[i] else None
@@ -332,21 +408,23 @@ class WanTTT(nn.Module):
                 ck, cv = ck.detach() if ck is not None else None, cv.detach() if cv is not None else None
             use_math = inner and inner_train
             grad = torch.is_grad_enabled() and (inner or inner_from is None or inner_train)
-            args = (x, e0, cos, sin, ck, cv, W1s[i], W2s[i], write)
+            args = (x, e0, cos, sin, ck, cv, W1s[i], W2s[i], Was[i], write)
             with torch.set_grad_enabled(grad), (sdpa_kernel(SDPBackend.MATH) if use_math else nullcontext()):
                 if self.grad_ckpt and grad and not inner:
-                    x, k, v, n1, n2 = checkpoint(blk, *args, use_reentrant=False)
+                    x, k, v, n1, n2, nA = checkpoint(blk, *args, use_reentrant=False)
                 else:
-                    x, k, v, n1, n2 = blk(*args)
+                    x, k, v, n1, n2, nA = blk(*args)
             ks.append(k)
             vs.append(v)
             if n1 is not None:
                 W1s[i] = n1
             if n2 is not None:
                 W2s[i] = n2
+            if nA is not None:
+                Was[i] = nA
         out = self.unpatchify(self.head(x, e), grid) if head else None
         if write:
-            state = state.push(ks, vs, W1s, W2s, self.max_ctx, grid[0])
+            state = state.push(ks, vs, W1s, W2s, Was, self.max_ctx, grid[0])
         return (out, state, x) if hidden else (out, state)  # hidden：再返回最后一层的 token 特征 [B, 960, D]（给 probe）
 
     def e2e_update(self, x0, a, state, sigma, noise):
@@ -354,36 +432,38 @@ class WanTTT(nn.Module):
         # 对 TTT 层的 fast weight 求梯度走一步。训练时 create_graph，外层 loss 能穿过这一步（gradient of gradient）
         cfg, B = self.ttt, x0.shape[0]
         train = torch.is_grad_enabled() and self.training
-        W1, W2 = list(state.W1), list(state.W2)
-        want = []
+        W1, W2, Wa = list(state.W1), list(state.W2), [dict(w) for w in state.Wa]
+        want = []  # (装它的 list / dict, 下标, 第几层, slow weight, e2e_lr 的第几列)
         with torch.enable_grad():
             for i in cfg.layers:
                 blk = self.blocks[i]
-                for Ws, w, p in ((W1, blk.ffn[0].weight[blk.ns:], "up"), (W2, blk.ffn[2].weight[:, blk.ns:], "down")):
-                    if cfg.params in (p, "both"):
-                        cur = w.expand(B, -1, -1) if Ws[i] is None else Ws[i]  # 每个样本一份，梯度才是 per-sample 的
-                        if not train:
-                            cur = cur.detach().requires_grad_(True)
-                        Ws[i] = cur
-                        want.append((Ws, i, p))
+                if cfg.params in ("up", "both"):
+                    want.append((W1, i, i, blk.ffn[0].weight[blk.ns:], 0))
+                if cfg.params in ("down", "both"):
+                    want.append((W2, i, i, blk.ffn[2].weight[:, blk.ns:], 1))
+                for j, p in enumerate(cfg.attn):
+                    want.append((Wa[i], p, i, getattr(blk.self_attn, p).weight[blk.na:], 2 + j))
+            for box, key, _, w, _ in want:
+                old = box.get(key) if isinstance(box, dict) else box[key]
+                cur = w.expand(B, -1, -1) if old is None else old  # 每个样本一份，梯度才是 per-sample 的
+                box[key] = cur if train else cur.detach().requires_grad_(True)
             s = sigma[:, None, None, None, None]
             x_t = (1 - s) * x0 + s * noise
             target = noise - x0
             l0 = min(cfg.layers)  # 训练：l0 以下的层只要一阶梯度（flash + checkpoint），l0 起要二阶（math，不 checkpoint）
-            st = state.replace(W1=W1, W2=W2)
+            st = state.replace(W1=W1, W2=W2, Wa=Wa)
             pred, _ = self.forward(x_t, sigma * 1000, a, st, inner_from=l0, inner_train=train)
             loss = (pred.float() - target).pow(2).mean(dim=(1, 2, 3, 4)).sum()  # 每个样本自己的 loss 加起来
-            grads = torch.autograd.grad(loss, [Ws[i] for Ws, i, _ in want], create_graph=train)
+            grads = torch.autograd.grad(loss, [box[key] for box, key, *_ in want], create_graph=train)
         lr = F.softplus(self.e2e_lr.float())
-        for (Ws, i, p), g in zip(want, grads):
-            blk = self.blocks[i]
+        for (box, key, i, w, col), g in zip(want, grads):
             if cfg.heads > 1:
                 g = g * head_mask(*g.shape[-2:], cfg.heads, g.device)
-            new = Ws[i] - lr[i, 0 if p == "up" else 1] * g
+            new = box[key] - lr[i, col] * g
             if cfg.norm:
-                new = renorm(new, blk.ffn[0].weight[blk.ns:] if p == "up" else blk.ffn[2].weight[:, blk.ns:])
-            Ws[i] = new if train else new.detach()
-        return state.replace(W1=W1, W2=W2)
+                new = renorm(new, w)
+            box[key] = new if train else new.detach()
+        return state.replace(W1=W1, W2=W2, Wa=Wa)
 
     def unpatchify(self, x, grid_size):
         B = x.shape[0]
@@ -410,5 +490,5 @@ def load_base(model, path):
     sd = sd.get("ema", sd)
     missing, unexpected = model.load_state_dict(sd, strict=False)
     assert not unexpected, unexpected
-    assert all(".ttt." in k or k == "e2e_lr" for k in missing), missing
+    assert all(".ttt" in k or k == "e2e_lr" for k in missing), missing  # .ttt.（FFN）/ .ttt_attn.（注意力）
     return model

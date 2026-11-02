@@ -157,7 +157,7 @@ def ttt_config(args):
     return TTTConfig(layers=parse_layers(args["ttt_layers"]), params=args["ttt_params"], loss=args["ttt_loss"],
                      value=args["ttt_value"], order=args["ttt_order"], lr=args["ttt_lr"], norm=bool(args["ttt_norm"]),
                      v_init=args["ttt_v_init"], e2e_sigma=args.get("e2e_sigma", -1.0), heads=args.get("ttt_heads", 1),
-                     fast_frac=args.get("ttt_fast_frac", 1.0))
+                     fast_frac=args.get("ttt_fast_frac", 1.0), attn=args.get("ttt_attn", ""), key=args.get("ttt_key", "self"))
 
 
 def main():
