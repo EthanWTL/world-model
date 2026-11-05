@@ -1,6 +1,168 @@
 # Auto research log: FFN fast weights (TTT) on the Shell Game world model
 
-## ★ Current conclusion (2026-10-31, read this first)
+## ★ Wave MC (started 2026-11-02 evening): state capacity vs parameter capacity
+
+**⏸ Local GPUs released (2026-11-03 17:22). Since then this task runs on Slurm only.**
+The user needs GPUs 6/7 for the paper. First they asked for a record of where every run stood, then said the paper side could kill our runs at any time. Then: "把所有的守护进程的都取消掉 slurm的不用取消 这样我们这个任务就完全不去用本地gpu了".
+- **17:22–17:23:** the paper side killed the 8 local runs (k1 s0 on GPU 6, k5 s0 on GPU 7). It started its own encode on 6/7 at ~17:25.
+- **17:24:48:** I stopped the feeder `waves/local_queue.py` (pid 36693). Its log shows no launch after 12:20, so nothing restarted on 6/7.
+- **17:30 check:** no process of this task is left on udc-an25-1 (ps, nvidia-smi). Users here cannot use crontab. Slurm jobs cannot land on udc-an25-1, because it is outside Slurm.
+- **No checkpoint was damaged.** All 23 .pt files of the 8 runs open as zips, have a readable data.pkl with the stored step, and pass a full CRC check. For example, k5 r1152 last.pt has 942/942 members matching, with 2.61 GB actually read.
+
+| run | last logged step | last.pt = resume point | kept ckpts | latest quick eval n05 / n10 (step) | T_learn |
+|---|---|---|---|---|---|
+| k1 r16 | 15350 | 15000 | 4K / 8K / 12K | .97 / 1.00 (15K) | 12000 |
+| k1 r72 | 15350 | 15000 | 4K / 8K / 12K | .28 / .19 (15K) | – |
+| k1 r288 | 15050 | 15000 | 4K / 8K / 12K | 1.00 / .97 (15K) | 9000 |
+| k1 r1152 | 14150 | 14000 | 4K / 8K / 12K | 1.00 / .88 (14K) | 10000 |
+| k5 r16 | 4350 | 4000 | 4K | .03 / .00 (4K) | – |
+| k5 r72 | 4300 | 4000 | 4K | .78 / .62 (4K), jumping | – |
+| k5 r288 | 4200 | 4000 | 4K | 1.00 / .94 (4K) | 3000 |
+| k5 r1152 | 4000 | 3500 | – | .06 / .00 (3K) | – |
+
+- k5 r1152 died inside its step-4000 quick eval, before the 4000 save. So it resumes from 3500 and has no ckpt_004000.
+- **Resubmitted to Slurm (17:29):** the same 8 cells, via `MODE=slurm KS="1 5" SEEDS=0 bash waves/mc.sh`.
+  - Train jobs: 22424375–22424389, odd IDs. Each eval job is train ID + 1, chained afterok.
+  - The IDs are appended to `mc_jobs.txt`.
+  - train.py resumes each cell from its last.pt in the same run dir.
+- **Now:** 32 train + 32 eval jobs on Slurm, nothing local. The event watcher (scratchpad, reads logs only, no GPU) keeps running for the Slurm results.
+- **Local GPUs again only when the user says so,** and after checking nvidia-smi:
+  - To start: `nohup python waves/local_queue.py --gpus 6 7 >> /project/sds-rise/ethan/Finetune/world/auto_research/logs/local_queue.log 2>&1 &`
+    - Started cells go first, i.e. every cell with a last.pt.
+    - It skips cells that are evaluated or running locally / on Slurm, and takes pending cells from Slurm.
+    - `--dry` prints the plan only.
+  - To stop: `python waves/local_queue.py --stop`
+    - It stops the feeder first, because otherwise the feeder refills freed slots within 5 min.
+    - Then it stops each run when that run is not writing a .pt, and logs the stop steps to `logs/local_queue.log`.
+- **Why resuming is safe:**
+  - train.py reloads last.pt: model, EMA, NorMuon state and step. The data are re-seeded with seed + step.
+  - A cell already at 20000 leaves the loop at once and goes straight to the eval.
+  - `log.jsonl` is appended. `mc.sh` now also appends (`>>`) to `logs/<run>_local.log`; before this change, a restart would have wiped it.
+
+**Question (user):** does the memory layer need more parameter capacity to remember more state? Three sub-questions, all on one grid fine-tuned from ema_200000:
+1. **Time:** with the same state count and the same capacity, is it just a matter of training longer? A curve that is still rising means time-limited; a flat curve means capacity-limited or stuck.
+2. **Capacity:** with the same state count, does a different capacity change the learning time?
+3. **Minimum capacity:** with the same time budget, does the minimum capacity grow with the state count?
+
+**No window anywhere (user):** max_ctx 0 in training and evaluation, so the memory is the only path between chunks. The full-attention multi-ball base stage I first proposed is dropped (`train_base.py` is kept but unused). The ema_200000 weights were trained with full attention, but nothing in this experiment can use a window.
+
+**Data: `Dataset/ShellGameMulti`** (`datagen/gen_multi.py` + `render_multi.html`):
+- k balls with fixed colors: ball b is always PALETTE[b] = red, green, blue, yellow, magenta, each under a different cup. k = 1 is exactly the old red ball.
+- The scene, actions and chunking are unchanged. Labels: `balls[c][b]` = slot of ball b at the end of chunk c. `ball/start/final` = ball 0, so the old probe still works.
+- `k{K}/train`: curriculum N = 0..5, count per N = min(120/1000/3000/3000/3000/3000, unique episodes) → 9.8K / 11.5K / 12.9K / 13.4K / 13.4K episodes for k = 1..5.
+- `k{K}/test/n05, n10, n20, n30`: 64 each, disjoint from train. 61K episodes and 8.0M frames in total (seed 2).
+
+**Detector (`detect.ball_slots`)**: HSV hue windows per color, red [330,20], green [95,160], blue [190,245], yellow [40,70], magenta [265,320], each with S/V minimums.
+- The table sits at hue 31–34 with S ≈ .40 (shadows up to ~.55), only ~15° from yellow, so yellow needs S > .65.
+- Calibration on rendered frames and on Wan VAE round-trip frames (encode/decode on CPU): every ball correct, 130–180 px in its slot vs ≤1 px anywhere else.
+- On old single-ball GT frames (test n05/n10/n30), `ball_slots(f, 1)` agrees with the paper's red detector on 384/384.
+
+**Metrics:**
+- `acc` = all k balls in the right slot (chance 1/5, 1/20, 1/60, 1/120, 1/120).
+- `ball` = per-ball accuracy.
+- `tf_p` = each ball's color mass at its true slot in the σ=1 one-step x0, averaged over balls.
+
+**Grid (`waves/mc.sh`, runs `mbc_k{k}_r{r}_s{seed}`, code frozen in `snapshots/mc`):**
+
+| axis | values |
+|---|---|
+| state | k = 1 / 2 / 3 / 5 balls → 5 / 20 / 60 / 120 states (2.3 / 4.3 / 5.9 / 6.9 bits); k = 4 also has 120 states, so it is skipped |
+| parameter capacity | r = 16 / 72 / 288 / 1152 fast q rows per layer, 4 blocks → 4.6K / 20.7K / 82.9K / 331.8K numbers per layer (12 layers: 55K / 0.25M / 1.0M / 4.0M per sample); r = 288 is the wh_q recipe |
+| time | quick eval every 1000 steps (k{K}/curr3, n05, n10 tf, 32 episodes, raw weights), up to 20000 steps |
+
+- Everything else is wh_q: delta rule on q, all 12 layers, curriculum N = 0..5, NorMuon 1e-4, B = 8, EMA .999.
+- Seeds 0 and 1. In a1, the jump timing turned out to be seed-random.
+- When a run finishes, its 20000-step EMA gets the full eval: N5/10/20/30, tf + free, 64 episodes, 50 steps.
+
+**Readouts (`python summary.py --cap mbc`):**
+- T_learn = the first quick-eval step where n05 tf all-correct ≥ .9. Runs that never reach it are censored at 20000.
+- Minimum r per budget (4K / 8K / 12K / 16K / 20K), for each k.
+- 20000-step EMA: all-correct and per-ball at N5/10/20/30. This is the "more swaps" axis.
+- Stage 2: cells not learned by 20000 continue to 40000, to separate "needs more time" from "cannot".
+
+**Caveats:**
+- r = 1152 makes all 16 heads fast and leaves no fallback heads, so it changes structure as well as size. Every r ≤ 288 keeps ≥ 12 fallback heads.
+- For k ≥ 2 the model also has to learn to render the new colors, because the base only knew red. In this design that cost is part of "more state". If k = 2..5 lag k = 1 by the same offset at every r, that offset is the color cost, not capacity.
+- Storage is nowhere near binding, even at r = 16 (55K numbers vs 6.9 bits). A minimum r that grows with k would therefore be a learnability or precision effect, not a storage one.
+
+**Predictions (before results):**
+- r ≥ 72 learns every k eventually, and T_learn grows with k.
+- r = 16 is uncertain. It may fail for every k, k = 1 included (in a1 one seed of 72 rows had still not learned at 10K); then the minimum r lies between 16 and 72 for all k, and the grid cannot resolve a k effect at that resolution.
+- Null for accuracy vs k (no capacity limit): per-ball accuracy stays at the k = 1 level and all-correct ≈ acc₁(N)^k. A swap moves 2k/5 balls on average (0.4 for k = 1, 2.0 for k = 5).
+
+**Status (2026-11-03 ~00:40):**
+- **Data:** all 60955 episodes rendered and encoded.
+  - Render: Slurm CPU arrays (one 32-core task + 76 small tasks + reruns).
+  - Encode: `encode_latents.py --follow` encodes while rendering. It uses per-episode lock files, so local and Slurm workers can share the work. Workers: local H200 × 2 at ~2.9 episodes/s each, Slurm A6000 × 8 at ~0.7 each.
+- **Runs:**
+  - k1 s0 (4 cells) run locally on GPU 6. GPU 1 was left alone because the user's `smoke_qv` test was running there.
+  - The other 28 runs are on Slurm; IDs are in `Finetune/world/auto_research/mc_jobs.txt`. Each run chains the full EMA eval.
+- **Step 1000, k1 s0, all r:** at chance (n05 .12–.16, p .20), i.e. still on the pre-jump plateau.
+
+**Interim 2026-11-03 12:15 (k1 seed 0, local GPU 6, step ~11000; quick eval, raw weights, 32 episodes):**
+
+| r (per-layer numbers) | n05 all-correct by step (1K, 2K, …) | first ≥ .9 | latest n05 / n10 |
+|---|---|---|---|
+| 16 (4.6K) | flat ≈ .2 until 9K, then .59 (10K), .75 (11K); p .47 → .73 → .85 | not yet (jumping now) | .75 / .59 |
+| 72 (20.7K) | ≈ .2 through 11K; p .18–.28 | no | .22 / .19 |
+| 288 (82.9K, the recipe) | jump at 5K (.59), .91 at 9K, .97 at 10K | 9000 | .97 / .88 |
+| 1152 (331.8K, no fallback) | jump at 5–7K, .91 at 10K | 10000 | .91 / .59 |
+
+- **Even r = 16 learns k = 1**: 16 fast q channels of one head, 4.6K numbers per layer. So for 5 states, the minimum capacity is ≤ 16 rows.
+- **Learning time is not monotonic in r** (16 jumped before 72). With one seed this is jump-time noise, as in a1. The seed-1 runs are needed before T_learn vs r can be read.
+
+**Scheduling change (12:15):** none of the 28 Slurm runs started in 12 h (all Priority; the user's a2 jobs hold the allocation). k5 s0 (4 cells) was moved to local GPU 7, the second allowed local GPU, and its Slurm copies were cancelled. k1 vs k5 at seed 0 will therefore come first.
+- The user confirmed: at most 2 local GPUs for this task. `waves/local_queue.py` (nohup, log `logs/local_queue.log`) feeds GPUs 6/7 in order k2 s0, k3 s0, k1 s1, k5 s1, k2 s1, k3 s1.
+  - Each GPU has 4 slots for our runs. When one of ours finishes and the GPU has ≥ 24 GB free, it starts the next cell. Other users' jobs stacked onto 6/7 do not make us yield (user: "别人叠上来的 就不要给他们让开").
+  - Per cell, it cancels the pending Slurm copy, or skips the cell if Slurm is already running or has finished it.
+
+**Interim 2026-11-03 16:00 (seed 0; quick eval, raw weights, 32 episodes; k1 at step 14000, k5 at step 3000):**
+
+| r | k1 (5 states): first ≥ .9 | k1 latest n05 / n10 | k5 (120 states): n05 all-correct at 1K / 2K / 3K (per-ball) | k5: first ≥ .9 |
+|---|---|---|---|---|
+| 16 | 12000 | .97 / .97 (14K) | .03 / .03 / .00 (.21 / .20 / .19) | not yet |
+| 72 | no; still ≈ .22 at 14K (curr3 .53) | .22 / .19 | .03 / .03 / .03 (.21 / .25 / .24) | not yet |
+| 288 | 9000 | 1.00 / .94 (13K) | .00 / .09 / **.94** (.18 / .39 / .98) | **3000** |
+| 1152 | 10000 | 1.00 / .84 (13K) | .00 / .03 / – (.17 / .25 / –) | not yet |
+
+- **k5 r288 learned at step 3000, 3× sooner than k1 r288 (9000).** At 3000 it has curr3 / n05 / n10 all-correct .97 / .94 / .78, per-ball .99 / .98 / .91, tf_p 1.00 / .99 / .97.
+  - The finished-video detector and the one-step x0 color mass agree, so this is not a detector artifact.
+  - n10 < n05 (errors pile up with length), so it is memory tracking, not a leak through the swap frames. A leak would be flat in N and would also lift r16 / r72, which are still at chance.
+  - The jump happened between 2K and 3K. At 2K, curr3 was already .16 with p .73.
+- **This contradicts the prediction "T_learn grows with k"** for r = 288 at seed 0. Three readings, not yet separable:
+  1. **Denser supervision with more balls.** Every k5 reveal grades 5 balls, and every swap moves 2 balls (0.4 on average for k1, where 60% of swaps are no-ops for the ball). So each episode carries more gradient about "apply this swap to the state".
+  2. **Seed-random jump time.** One seed per cell so far.
+  3. **The base prior.** k1 is the base's own task, which was learned with a window. The memory may first have to stop relying on the missing window, while k5 builds a new path anyway.
+- **The color cost was small.** At step 0, k5 per-ball is .03, because the base draws no new colors. By 1K it is .17–.21, the level of drawing all 5 colors in random slots. So learning the colors took < 1000 steps, not a large offset.
+- **Question 3 (minimum r vs k) is still open.** k1 learned at r = 16, so if k5 r16 also learns, 120 states need no more rows than 5 states in this range.
+
+**Pitfalls hit while launching:**
+- **19. `sh -c "..."` + a multi-line argument string.** The newline ends the command, so every flag after the line break was silently dropped. The first local launch ran heads=1, fast_frac=1.0, 6000 steps for all four cells. It was caught from the printed TTTConfig and killed after ~1 min. Fix in `waves/mc.sh`: `T=$(echo $T)` before `sh -c`. Slurm mode was not affected, because `sbatch ... $T` word-splits.
+- **20. Packing several runs onto one H200 does not raise throughput.** 4 q-memory runs together take 4.2 s/step each, about the same total as 1 run alone (~1 s/step). One run already saturates the GPU (~1.5e14 FLOP per step). The whole grid (32 × 20K steps) is about 180 H200-hours.
+- **21. Small render tasks (8 cores, 4 Chrome workers) are ~4× slower per worker than 32-core tasks**, and 30 of 76 hit the 1 h limit. Reruns skip finished videos, so nothing was lost.
+
+## ★ Update 2026-11-01 (read first): memory in attention q beats the FFN
+
+Config `wh_q` / `wi_q_s1`:
+- Delta rule on the **q projection only**: `--ttt-params none --ttt-attn q`, so the FFN is not updated.
+- `--ttt-fast-frac 0.25 --ttt-heads 4`: the fast part is the q channels of the last 4 attention heads, block-diagonal over those 4 heads.
+- All 12 layers, max_ctx 0, curriculum, 12000 steps, EMA.
+
+| | N5 | N10 | N20 | N30 |
+|---|---|---|---|---|
+| **q only, seed 0 / seed 1 (free)** | .98 / 1.00 | 1.00 / 1.00 | .97 / .94 | **.91 / .95** |
+| k only, seed 0 (free) | .97 | 1.00 | .97 | .88 |
+| FFN best below (6000 steps, 3-seed mean, free) | 1.00 | .99 | .88 | .71 |
+| paper's LaCT8 (free) | 1.00 | 1.00 | .98 | .69 |
+
+Caveats and rules learned (details in Wave H / H2 / I):
+- The attention runs had 12000 steps vs 6000 for the FFN. The equal-budget FFN run (wi_ffn_12k) is running.
+- **Never make v fast** (pitfall 18): x0 error blows up 30–1000× beyond the training length.
+- **dot and e2e learn nothing**, in every setting tried.
+- Attention runs jump late, around step 5000–6000 (pitfall 17), so evaluate the EMA only after about 12k steps.
+- A learned write key (`--ttt-key proj`) does not help.
+
+## ★ Previous conclusion (2026-10-31): FFN memory
 
 **Native-FFN TTT can make the world model track the hidden state well beyond the training length.**
 
@@ -697,3 +859,27 @@ Wave G interim (quick eval, raw weights): wg_inplace at step 5000 reaches curr3 
 - **Recommendation: put the memory in q or k only.**
 
 Caveat on the fallback for q/k: that RMSNorm is over the whole 1152-dim q (or k), not per head. The fast heads therefore change each token's RMS and rescale the fallback heads' q/k by a common factor, so the q/k fallback is not perfectly isolated (v's fallback is).
+
+More 12k results (EMA, thorough; free N5/10/20/30, x0 MSE at N10/N20/N30):
+- wh_v_f1 (v, all heads fast): free 1.00/.25/.19/.09. The x0 MSE is already 1.06 at N10: without the fallback, a fast v blows up even sooner (pitfall 18).
+- wh_v_dot: .28/.14/.12/.00, and wh_qkv_dot: .39/.16/.05/.00. Even 12k steps of dot never learns, and a fast v drifts here too (x0 MSE .09–.25 at N20/N30).
+- wg_dot_down_f025h8 (FFN dot): .31/.12/.17/.22. Still at chance at 12k, but stable (x0 MSE ≤ .008). **dot is dead in every setting.**
+
+Wave I scheduling: wi_q_s1 and wi_q_key are trained locally on GPUs 6/7 (`scratchpad run_local.sh`, code `snapshots/wi`, train then eval). Their Slurm copies were cancelled. The other four wave I runs stay on Slurm.
+
+### Wave I, first results (local GPUs, 12000 steps, EMA, thorough: 64 episodes, 50 steps)
+
+| run | free N5/10/20/30 | tf N5/10/20/30 | σ=1 x0 MSE N5/10/20/30 |
+|---|---|---|---|
+| wh_q (seed 0, from H2) | .98/1.00/.97/.91 | 1.00/1.00/.97/.92 | .0003/.0016/.0008/.0023 |
+| **wi_q_s1** (seed 1) | **1.00/1.00/.94/.95** | 1.00/1.00/.97/.95 | .0003/.0016/.0010/.0024 |
+| wi_q_key (q + `--ttt-key proj`) | 1.00/1.00/.94/.81 | 1.00/1.00/.97/.81 | .0002/.0016/.0012/.0031 |
+
+- **q-only memory reproduces on a second seed.** N30 free goes .91 → .95; the two-seed mean is .99/1.00/.955/.93. Generation stays stable (x0 MSE ≤ .003 everywhere).
+- **A learned write key does not help.** N20 is the same, N30 drops to .81.
+  - This is a single seed. At p≈.9, 64 episodes give SE ≈ .04, so the drop is about 2 SE: likely worse, not certain.
+  - The key-proj run's write size keeps growing during training (dW q .24 at 12k, vs .09–.16 with key=self). Hypothesis, unverified: a learned key inflates ‖k‖, so the effective step η‖k‖² grows, and bigger writes drift more over 30 swaps.
+  - Answer to the "LaCT k → v" question: in our in-place design, a separately learned write address (LaCT-style k) buys nothing. k = the layer's own input is already the right address.
+- Training probes (raw weights, N0–5) look alike for all three runs. Only the long-horizon eval separates them.
+
+Scheduling: GPU 6 was taken by another user after wi_q_s1 finished. wi_ffn_12k was moved to local GPU 7 (Slurm copy cancelled), resuming from the copied `wd_mse_down_c0_f025_h8` last.pt. wi_ffn_key, wi_q_s2 and wi_k_s1 stay on Slurm, pending behind the user's own pgo jobs.

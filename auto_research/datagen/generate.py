@@ -89,7 +89,7 @@ class Jobs:
                     return {"wait": True}
                 task = stale[0]
             self.inflight[task["id"]] = (task, time.time())
-            return {"id": task["id"], "start": task["start"], "swaps": task["swaps"]}
+            return {k: v for k, v in task.items() if k != "out"}  # auto_research: extra fields (starts) go to the page too
 
     def finish(self, task_id, mp4):
         with self.lock:
@@ -143,7 +143,7 @@ def make_handler(jobs):
     return Handler
 
 
-def render(tasks, workers, chrome, chrome_args):
+def render(tasks, workers, chrome, chrome_args, page="render.html"):
     jobs = Jobs(tasks)
     server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(jobs))
     port = server.server_address[1]
@@ -153,7 +153,7 @@ def render(tasks, workers, chrome, chrome_args):
         chrome, "--headless=new", f"--user-data-dir={profile_dir / f'w{w}'}", "--no-first-run",
         "--no-default-browser-check", "--disable-extensions", "--mute-audio",
         "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
-        "--disable-backgrounding-occluded-windows", *chrome_args, f"http://127.0.0.1:{port}/render.html?w={w}",
+        "--disable-backgrounding-occluded-windows", *chrome_args, f"http://127.0.0.1:{port}/{page}?w={w}",
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for w in range(workers)]
     t0 = time.time()
     try:

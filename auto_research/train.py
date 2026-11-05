@@ -4,6 +4,7 @@
 # 外层 loss 穿过所有 commit 反传（BPTT），所以 Wv / lr / slow weights 学的是"写什么、怎么写"
 #   python train.py --run dot_both_all --ttt-layers all --ttt-params both --ttt-loss dot
 #   python train.py --run ctrl_swa1                       （不开 TTT：SWA1 对照）
+#   多球（Dataset/ShellGameMulti，只用 k 个球的数据，课程 N=0..5）：--data multi --balls 3 --base <train_base.py 的 ema_*.pt>
 import argparse
 import copy
 import json
@@ -16,7 +17,7 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 import torch
 import torch.nn as nn
 
-from data import ShellGameDataset, curriculum_loader, infinite_loader
+from data import ShellGameDataset, curriculum_loader, infinite_loader, multi_curriculum_loader
 from evaluate import BASE, Evaluator, parse_layers, ttt_config
 from normuon import NorMuon
 from wm import BallProbe, FastWriter, WanTTT, commit, load_base
@@ -58,7 +59,9 @@ def get_args(argv=None):
     ap.add_argument("--eval-every", type=int, default=500)
     ap.add_argument("--eval-num", type=int, default=32)
     ap.add_argument("--eval-at-start", type=int, default=1)
-    ap.add_argument("--eval-splits", nargs="+", default=["test/n05", "test/n10", "test/n20"])  # 课程训练加 curr3
+    ap.add_argument("--eval-splits", nargs="+", default=None)  # 默认 test/n05 n10 n20；课程训练加 curr3
+    ap.add_argument("--data", default="single", choices=["single", "multi"])  # multi：多球数据（一定是课程）
+    ap.add_argument("--balls", type=int, default=1)  # multi：用几个球的数据（k）
     ap.add_argument("--save-every", type=int, default=500)
     ap.add_argument("--keep-every", type=int, default=2000)
     ap.add_argument("--log-every", type=int, default=50)
@@ -173,10 +176,17 @@ def main():
     n_new = sum(p.numel() for n, p in model.named_parameters() if ".ttt." in n or n == "e2e_lr")
     print(f"run {args.run} | TTT {model.ttt} | max_ctx {args.max_ctx} | new params {n_new / 1e6:.2f}M | start step {step}",
           flush=True)
-    if args.curriculum:
+    if args.data == "multi":
+        assert args.curriculum, "多球数据只有课程版（N = 0..5）"
+        batches = multi_curriculum_loader(args.batch, [args.balls], args.workers, seed=args.seed + step)
+    elif args.curriculum:
         batches = curriculum_loader(args.batch, args.workers, seed=args.seed + step)
     else:
         batches = infinite_loader(ShellGameDataset(split="train"), args.batch, args.workers, seed=args.seed + step)
+    if args.eval_splits is None:
+        args.eval_splits = (["curr3"] if args.curriculum else []) + ["test/n05", "test/n10", "test/n20"]
+        if args.data == "multi":
+            args.eval_splits = [f"k{args.balls}/{s}" for s in args.eval_splits]
     evaluator = Evaluator(tuple(args.eval_splits), num=args.eval_num, steps=20)
     log = open(out / "log.jsonl", "a")
     use_wandb = False

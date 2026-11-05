@@ -50,6 +50,104 @@ def claim(root, shard, num_shards):
     return True
 
 
+def listing(d, kind, suffix):
+    # d/kind/XX/ 下面已经写好的文件（列目录比一个个 stat 快得多；.tmp 半成品不算）
+    out, base = set(), d / kind
+    if base.exists():
+        for sub in os.listdir(base):
+            if (base / sub).is_dir():
+                out.update(f"{kind}/{sub}/{f}" for f in os.listdir(base / sub) if f.endswith(suffix))
+    return out
+
+
+def lock(d, ep, steal_after):
+    # 一个 episode 一个锁文件（O_EXCL），本地和 Slurm 的 worker 可以一起编；锁太旧还没出 latent = 那个 worker 死了，抢过来
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / f"{ep['id']:06d}"
+    for _ in range(2):
+        try:
+            fd = os.open(f, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, f"{socket.gethostname()} pid {os.getpid()}\n".encode())
+            os.close(fd)
+            return True
+        except FileExistsError:
+            try:
+                if time.time() - f.stat().st_mtime < steal_after:
+                    return False
+                f.unlink()
+            except FileNotFoundError:
+                pass
+    return False
+
+
+def encode_items(items, vae, mean, std, pool, root, tag):
+    # items: [(split, [ep, ...])]，一个 batch 里帧数一样；CPU 线程提前解码几个 batch
+    loads = deque()
+
+    def prefetch(n):
+        if n < len(items):
+            split, b = items[n]
+            loads.append(pool.submit(lambda: np.stack([read_video(root / split / ep["video"]) for ep in b])))
+
+    for n in range(4):
+        prefetch(n)
+    for n, (split, batch) in enumerate(items):
+        video = loads.popleft().result()
+        prefetch(n + 4)
+        x = torch.from_numpy(video).cuda().permute(0, 4, 1, 2, 3).float() / 127.5 - 1  # [B, 3, T, H, W]
+        with torch.no_grad():
+            z = ((vae.encode(x).latent_dist.mode() - mean) / std).half().cpu().numpy()
+        for ep, zi in zip(batch, z):
+            out = latent_path(root, split, ep)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            tmp = out.with_name(out.name + f".tmp.{tag}")
+            with open(tmp, "wb") as f:
+                np.save(f, zi)
+            os.replace(tmp, out)
+
+
+def follow(args, root, metas, vae, mean, std, pool, tag):
+    # 边渲染边编码：反复扫一遍，哪些视频已经渲染好、还没有 latent、没人锁着，就锁上编掉；全部都有 latent 了才退出
+    t0, done = time.time(), 0
+    while True:
+        ready, left = [], 0
+        for split in args.splits:
+            vids, lats = listing(root / split, "videos", ".mp4"), listing(root / split, "latents", ".npy")
+            for ep in metas[split]:
+                if ep["video"].replace("videos/", "latents/").replace(".mp4", ".npy") not in lats:
+                    left += 1
+                    if ep["video"] in vids:
+                        ready.append((split, ep))
+        if left == 0:
+            break
+        groups = {}
+        for split, ep in ready:
+            groups.setdefault((split, ep["num_frames"]), []).append(ep)
+        items = []
+        for (split, _), eps in groups.items():
+            got = []
+            for ep in eps:
+                if lock(root / "logs" / "encode_locks" / split, ep, args.steal_after):
+                    got.append(ep)
+                    if len(got) == args.batch:
+                        items.append((split, got))
+                        got = []
+                        if len(items) >= 32:
+                            break
+            if got:
+                items.append((split, got))
+            if len(items) >= 32:
+                break
+        if not items:
+            print(f"[follow] {left} left, nothing ready yet", flush=True)
+            time.sleep(60)
+            continue
+        encode_items(items, vae, mean, std, pool, root, tag)
+        done += sum(len(b) for _, b in items)
+        print(f"[follow] {done} encoded by me, {done / (time.time() - t0):.2f}/s, {left} left before this round", flush=True)
+    print(f"[follow] all done: {done} episodes by me in {(time.time() - t0) / 60:.1f} min", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="/project/sds-rise/ethan/Dataset/ShellGame")
@@ -58,6 +156,8 @@ def main():
     ap.add_argument("--limit", type=int, default=None, help="encode only the first LIMIT episodes of each split")
     ap.add_argument("--num-shards", type=int, default=64, help="shard s = episodes with id %% NUM_SHARDS == s, in every split")
     ap.add_argument("--claim", action="store_true", help="encode only shards no other worker has claimed")
+    ap.add_argument("--follow", action="store_true", help="auto_research: encode while rendering, per-episode locks")
+    ap.add_argument("--steal-after", type=float, default=1800, help="--follow: a lock this old without a latent is stale")
     args = ap.parse_args()
     root = Path(args.root)
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
@@ -70,6 +170,8 @@ def main():
     metas = {split: [json.loads(line) for line in open(root / split / "meta.jsonl")][:args.limit] for split in args.splits}
 
     pool = ThreadPoolExecutor(4)
+    if args.follow:
+        return follow(args, root, metas, vae, mean, std, pool, tag)
     for shard in range(args.num_shards):
         if args.claim and not claim(root, shard, args.num_shards):
             continue

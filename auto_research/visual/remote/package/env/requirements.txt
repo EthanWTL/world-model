@@ -1,0 +1,14 @@
+# The direct dependencies of the package (exact versions). setup_env.sh installs, in this order:
+#   1. python 3.11 (conda-forge)
+#   2. torch 2.8.0 from the PyTorch index (default build cu128)
+#   3. requirements.lock.txt = these packages + every dependency, exact
+# Nothing else: no flash-attn (attention runs on torch SDPA), no model repositories (the VAE class comes from diffusers).
+diffusers==0.36.0
+huggingface-hub==0.36.0
+safetensors==0.6.2
+numpy==2.2.6
+pillow==11.3.0
+imageio==2.37.0
+imageio-ffmpeg==0.6.0
+pyyaml==6.0.2
+wandb==0.22.0

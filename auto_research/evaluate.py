@@ -5,6 +5,9 @@
 #   解码后 5 个杯子位置各有多少红色 -> p_true（对的杯子占的比例，0.2 = 瞎猜，1 = 确定）
 #   python evaluate.py --ckpt /project/sds-rise/ethan/Finetune/world/auto_research/<run>/ema_006000.pt
 #   python evaluate.py --base .../ema_160000.pt --max-ctx 7      （基础模型，不微调）
+# 多球（Dataset/ShellGameMulti）：split 写成 k3/test/n05、k3/curr3；acc = 所有球都在对的位置，ball = 每个球单独算的准确率，
+#   p = 每个球的颜色在对的位置占的比例（对球取平均）
+#   python evaluate.py --ckpt .../mb_q_k3_s0/ckpt_024000.pt --balls 3     （= --splits k3/test/n05 k3/test/n10 k3/test/n20 k3/test/n30）
 import argparse
 import json
 import os
@@ -16,8 +19,8 @@ import numpy as np
 import torch
 from torch.utils.data import default_collate
 
-from data import ShellGameDataset
-from detect import ball_slot
+from data import MULTI, MultiBallDataset, ShellGameDataset
+from detect import ball_slot, ball_slots, color_mass
 from wm import TTTConfig, WanTTT, commit, load_base
 
 BASE = "/project/sds-rise/ethan/Finetune/world/shellgame_normuon/ema_160000.pt"
@@ -89,6 +92,14 @@ def final_chunk(model, x0, a, n_ctx, steps, seed):
 
 def make_split(s):
     # "currN"：课程数据里交换 N 次的 episode（是训练集里的，只用来看早期有没有学到）；其余就是 Dataset/ShellGame 下的 split
+    # "kK/..."：多球数据，"kK/currN" = 多球训练集里交换 N 次的
+    if s.startswith("k") and "/" in s:
+        k, rest = s.split("/", 1)
+        if rest.startswith("curr"):
+            ds = MultiBallDataset(MULTI, f"{k}/train")
+            ds.eps = [ep for ep in ds.eps if len(ep["actions"]) - 3 == int(rest[4:])]
+            return ds
+        return MultiBallDataset(MULTI, s)
     if s.startswith("curr"):
         ds = ShellGameDataset("/project/sds-rise/ethan/Dataset/ShellGameCurr", "train")
         ds.eps = [ep for ep in ds.eps if len(ep["actions"]) - 3 == int(s[4:])]
@@ -108,15 +119,18 @@ class Evaluator:
         model.eval()
         res = {}
         for split, ds in self.data.items():
-            name = split.split("/")[-1]
+            name = split.replace("test/", "").replace("/", "_")  # test/n05 -> n05；k3/test/n05 -> k3_n05；k3/curr3 -> k3_curr3
             for mode in self.modes:
-                hit, hit1, ptrue, mse1 = [], [], [], []
+                hit, hit1, ptrue, mse1, ball = [], [], [], [], []
                 for i in range(0, min(self.num, len(ds)), self.batch):
                     b = default_collate([ds[j] for j in range(i, min(i + self.batch, self.num, len(ds)))])
                     x0, a, gt = b["latent"].cuda(), b["actions"].cuda(), b["ball"][:, -1]
                     n_ctx = a.shape[1] - 1 if mode == "tf" else 2
                     with torch.autocast("cuda", dtype=torch.bfloat16):
                         x, x0_hat = final_chunk(model, x0, a, n_ctx, self.steps, self.seed + i)
+                    if "balls" in b:  # 多球
+                        self.multi(b["balls"][:, -1], x, x0_hat, x0, hit, ball, ptrue, hit1, mse1)
+                        continue
                     hit += [ball_slot(f[-1].cpu().numpy()) == g for f, g in zip(self.vae.decode(x), gt.tolist())]
                     m = slot_mass(self.vae.decode(x0_hat)).cpu()
                     p = torch.where(m.sum(1, keepdim=True) > 0, m / m.sum(1, keepdim=True).clamp(min=1e-8), 0.2)
@@ -124,12 +138,28 @@ class Evaluator:
                     hit1 += (p.argmax(1) == gt).tolist()
                     mse1 += (x0_hat - x0[:, :, -5:]).pow(2).mean((1, 2, 3, 4)).tolist()  # 连续指标：σ=1 一步预测和 GT 差多少
                 res[f"{name}_{mode}_acc"] = float(np.mean(hit))
+                if ball:
+                    res[f"{name}_{mode}_ball"] = float(np.mean(ball))
                 if mode == "tf":
                     res[f"{name}_tf_p"] = float(np.mean(ptrue))
                     res[f"{name}_tf_acc1"] = float(np.mean(hit1))
                     res[f"{name}_tf_mse1"] = float(np.mean(mse1))
         model.train(was)
         return res
+
+    def multi(self, gt, x, x0_hat, x0, hit, ball, ptrue, hit1, mse1):
+        # gt: [B, 5] 最后每个球在几号位（-1 = 没有这个球，一个 split 里 k 都一样）
+        k = int((gt[0] >= 0).sum())
+        gt = gt[:, :k].cuda()                                                        # [B, k]
+        det = torch.tensor([ball_slots(f[-1], k) for f in self.vae.decode(x)], device="cuda")  # [B, k]
+        hit += (det == gt).all(1).tolist()
+        ball += (det == gt).float().mean(1).tolist()
+        m = color_mass(self.vae.decode(x0_hat)[:, -4:], k)                           # [B, k, 5]
+        tot = m.sum(-1, keepdim=True)
+        p = torch.where(tot > 0, m / tot.clamp(min=1e-8), torch.full_like(m, 0.2))
+        ptrue += p.gather(-1, gt[..., None])[..., 0].mean(1).tolist()
+        hit1 += (p.argmax(-1) == gt).all(1).tolist()
+        mse1 += (x0_hat - x0[:, :, -5:]).pow(2).mean((1, 2, 3, 4)).tolist()
 
 
 def build_from_ckpt(path, key=None):
@@ -167,6 +197,7 @@ def main():
     ap.add_argument("--base", default=BASE)  # 不给 --ckpt 时：直接评基础模型
     ap.add_argument("--max-ctx", type=int, default=7)
     ap.add_argument("--splits", nargs="+", default=["test/n05", "test/n10", "test/n20", "test/n30"])
+    ap.add_argument("--balls", type=int, default=0)  # >0：多球，splits 换成 k{balls}/test/n05 … n30
     ap.add_argument("--modes", nargs="+", default=["tf", "free"])
     ap.add_argument("--num", type=int, default=64)
     ap.add_argument("--batch", type=int, default=16)
@@ -175,6 +206,8 @@ def main():
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     torch.cuda.set_device(args.gpu)
+    if args.balls:
+        args.splits = [f"k{args.balls}/{s}" for s in args.splits]
     if args.ckpt:
         model, _, _ = build_from_ckpt(args.ckpt, args.key)
         out = Path(args.out or Path(args.ckpt).parent / "eval" / f"{Path(args.ckpt).stem}.json")

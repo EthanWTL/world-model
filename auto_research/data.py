@@ -63,3 +63,49 @@ def curriculum_loader(batch_size, num_workers=6, seed=0, ns=(0, 1, 2, 3, 4, 5),
     sampler = CurriculumSampler(buckets, [1.0] * len(ns), batch_size, seed)
     yield from DataLoader(ds, batch_sampler=sampler, num_workers=num_workers, pin_memory=True,
                           persistent_workers=num_workers > 0)
+
+
+# ---- 多球（Dataset/ShellGameMulti，datagen/gen_multi.py）----
+MULTI = "/project/sds-rise/ethan/Dataset/ShellGameMulti"
+
+
+class MultiBallDataset(ShellGameDataset):
+    # split = "k3/train"、"k3/test/n05"…；再返回 balls [K, 5]：每个 chunk 结束时每个球在几号位（没有的球 = -1）
+    # （ball 还是球 0 = 红球的位置，probe 照旧用它）
+    def __getitem__(self, i):
+        d = super().__getitem__(i)
+        ep = self.eps[i]
+        balls = torch.full((len(ep["actions"]), 5), -1)
+        balls[:, :ep["k"]] = torch.tensor(ep["balls"])
+        d["balls"] = balls
+        return d
+
+
+class MultiSampler(torch.utils.data.Sampler):
+    # 每步抽一个 N（一个 batch 的 N 一样，chunk 数才一样），batch 里每个样本再各抽一个 k，从 (k, N) 桶里有放回地抽
+    # seed_n 只管抽 N：DDP 时每张卡给一样的 seed_n，同一步大家的序列一样长；seed 管抽 k 和 episode（每张卡不同）
+    def __init__(self, buckets, ks, ns, batch, seed=0, seed_n=None):
+        self.buckets = {key: torch.tensor(v) for key, v in buckets.items()}
+        self.ks, self.ns, self.batch = list(ks), list(ns), batch
+        self.g = torch.Generator().manual_seed(seed)
+        self.gn = torch.Generator().manual_seed(seed if seed_n is None else seed_n)
+
+    def __iter__(self):
+        while True:
+            n = self.ns[torch.randint(len(self.ns), (1,), generator=self.gn).item()]
+            out = []
+            for j in torch.randint(len(self.ks), (self.batch,), generator=self.g).tolist():
+                b = self.buckets[(self.ks[j], n)]
+                out.append(b[torch.randint(len(b), (1,), generator=self.g)].item())
+            yield out
+
+
+def multi_curriculum_loader(batch_size, ks, num_workers=6, seed=0, seed_n=None, ns=(0, 1, 2, 3, 4, 5), root=MULTI):
+    # ks = [3]：只用 3 个球的数据（TTT 一个 run 一个 k）；ks = [1, 2, 3, 4, 5]：混在一起（train_base.py）
+    dss = [MultiBallDataset(root, f"k{k}/train") for k in ks]
+    eps = [ep for ds in dss for ep in ds.eps]  # 和 ConcatDataset 的下标一一对应
+    buckets = {(k, n): [i for i, ep in enumerate(eps) if ep["k"] == k and len(ep["actions"]) - 3 == n] for k in ks for n in ns}
+    assert all(buckets.values()), {key: len(v) for key, v in buckets.items()}
+    sampler = MultiSampler(buckets, ks, ns, batch_size, seed, seed_n)
+    yield from DataLoader(torch.utils.data.ConcatDataset(dss), batch_sampler=sampler, num_workers=num_workers,
+                          pin_memory=True, persistent_workers=num_workers > 0)

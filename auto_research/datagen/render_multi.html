@@ -1,0 +1,200 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Shell Game renderer</title>
+</head>
+<body>
+<script type="importmap">
+{ "imports": { "three": "./vendor/three.module.js", "mp4-muxer": "./vendor/mp4-muxer.mjs" } }
+</script>
+<script type="module">
+// Shell Game renderer (arXiv 2608.30692, Appendix D), adapted from cup.html of Liu & Lee (2026),
+// https://github.com/liutiedong/shellgame (MIT). Scene parameters are cup.html's defaults.
+// Driven by generate.py: pulls episodes from /task, POSTs the encoded mp4 to /result.
+// auto_research multi-ball version (gen_multi.py): task.starts = start slot of every ball (k <= 5, distinct slots);
+// ball b always has color PALETTE[b], so k = 1 is the original single red ball.
+import * as THREE from 'three';
+import * as Mp4Muxer from 'mp4-muxer';
+
+const W = 256, H = 192, FPS = 16;
+const NUM_CUPS = 5, CUP_SPACING = 8;
+const POS = Array.from({ length: NUM_CUPS }, (_, i) => (i - (NUM_CUPS - 1) / 2) * CUP_SPACING);
+const DOWN_Y = 2.5, UP_Y = 8, ARC_DEPTH = 5;  // cup.html's arc slider default
+const BITRATE = 2_000_000;  // cup.html: max(2 Mbps, 8 bits per pixel)
+
+// ---- scene (cup.html defaults) ----
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x333333);
+
+// The paper's 256x192 frames are a 16:9 view squashed to 4:3. Camera fitted to their released
+// ground-truth videos (cup.html slider units): fov 20, y 37, z 54.
+const camera = new THREE.PerspectiveCamera(20, 16 / 9, 0.1, 1000);
+camera.position.set(0, 37, 54);
+camera.lookAt(0, 0, 0);
+
+const canvas = document.createElement('canvas');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(1);
+renderer.setSize(W, H, false);
+renderer.shadowMap.enabled = true;
+
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+scene.add(ambientLight);
+const directionalLight = new THREE.DirectionalLight(0xffffff, 1.5);
+directionalLight.position.set(10, 20, 5);
+directionalLight.castShadow = true;
+directionalLight.shadow.camera.top = 30;
+directionalLight.shadow.camera.bottom = -30;
+directionalLight.shadow.camera.left = -30;
+directionalLight.shadow.camera.right = 30;
+directionalLight.shadow.mapSize.width = 2048;
+directionalLight.shadow.mapSize.height = 2048;
+directionalLight.shadow.bias = -0.0001;
+scene.add(directionalLight);
+
+const cupMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, metalness: 0.0, roughness: 0.85, shadowSide: THREE.DoubleSide });
+// red (the original ball), green, blue, yellow, magenta: hues ~60-90 degrees apart, all far more saturated than the table
+const PALETTE = [0xe63946, 0x2ecc40, 0x1f6feb, 0xffd60a, 0xb83dd6];
+const ballMaterials = PALETTE.map(c => new THREE.MeshStandardMaterial({ color: c, metalness: 0.0, roughness: 0.4 }));
+const tableMaterial = new THREE.MeshStandardMaterial({ color: 0xb8956e, metalness: 0.0, roughness: 0.65 });
+
+// the paper's frames show table everywhere, so the plane is larger than cup.html's 100x100
+const table = new THREE.Mesh(new THREE.PlaneGeometry(400, 400), tableMaterial);
+table.rotation.x = -Math.PI / 2;
+table.position.y = -2.5;
+table.receiveShadow = true;
+scene.add(table);
+
+function createCup() {
+    const points = [];
+    const bottomRadius = 0.25, topRadius = 0.42, height = 1.0, rimThickness = 0.03;
+    points.push(new THREE.Vector2(0, 0));
+    points.push(new THREE.Vector2(bottomRadius * 0.9, 0));
+    points.push(new THREE.Vector2(bottomRadius, 0.02));
+    points.push(new THREE.Vector2(bottomRadius, 0.08));
+    points.push(new THREE.Vector2(topRadius, height));
+    const steps = 8;
+    for (let i = 0; i <= steps; i++) {
+        const theta = (i / steps) * Math.PI + Math.PI;
+        const cx = topRadius + rimThickness / 2;
+        points.push(new THREE.Vector2(cx + Math.cos(theta) * rimThickness / 2, height + Math.sin(theta) * rimThickness / 2));
+    }
+    const geometry = new THREE.LatheGeometry(points, 64);
+    geometry.computeVertexNormals();
+    const cup = new THREE.Mesh(geometry, cupMaterial);
+    cup.castShadow = true;
+    cup.receiveShadow = true;
+    cup.scale.set(5, 5, 5);
+    cup.rotation.x = Math.PI;  // upside down
+    return cup;
+}
+// cups are identical, so cups[i] can simply live in slot i and snap back after every swap
+const cups = POS.map(x => { const c = createCup(); c.position.set(x, DOWN_Y, 0); scene.add(c); return c; });
+
+const balls = ballMaterials.map(m => {
+    const b = new THREE.Mesh(new THREE.SphereGeometry(1, 32, 32), m);
+    b.castShadow = true;
+    b.position.set(0, -1.5, 0);
+    b.visible = false;
+    scene.add(b);
+    return b;
+});
+
+// ---- timeline ----
+// cup.html's lift easing (flat start, fast rise, settles at 1)
+function liftCurve(p) {
+    p = Math.min(1, Math.max(0, p));
+    const e = 1 - Math.pow(1 - p, 2) * (1 + 2.5 * (1 - p));
+    return Math.min(1, Math.max(0, e * 1.1 - 0.05));
+}
+
+// 16 fps. Phase 0 = frames 0..16 (17 frames, first latent chunk); phase k>=1 = the 20 frames after frame 16+20(k-1).
+//   reveal : lift over 1000 ms           lower : hold 625 ms, lower 625 ms
+//   swap   : swap 1000 ms, hold 250 ms    final reveal : lift 500 ms, hold 750 ms
+function setFrame(f, ep) {
+    const n = ep.swaps.length;
+    const k = f <= 16 ? 0 : 1 + Math.floor((f - 17) / 20);
+    const u = k === 0 ? f : f - (16 + 20 * (k - 1));  // frames since the phase started, 1..20 for k >= 1
+
+    let y = DOWN_Y;
+    if (k === 0) y = DOWN_Y + (UP_Y - DOWN_Y) * liftCurve(u / 16);
+    else if (k === 1) y = UP_Y - (UP_Y - DOWN_Y) * liftCurve((u - 10) / 10);
+    else if (k === n + 2) y = DOWN_Y + (UP_Y - DOWN_Y) * liftCurve(u / 8);
+    for (let c = 0; c < NUM_CUPS; c++) cups[c].position.set(POS[c], y, 0);
+
+    if (k >= 2 && k <= n + 1) {
+        const [a, b] = ep.swaps[k - 2];  // a < b: left cup passes behind, right cup in front
+        const p = Math.min(1, u / 16);
+        const eased = 0.5 - 0.5 * Math.cos(p * Math.PI);
+        const arc = (b - a === 1 ? ARC_DEPTH : ARC_DEPTH * 1.5) * Math.sin(p * Math.PI);
+        cups[a].position.set(POS[a] + (POS[b] - POS[a]) * eased, DOWN_Y, -arc);
+        cups[b].position.set(POS[b] + (POS[a] - POS[b]) * eased, DOWN_Y, arc);
+    }
+
+    // the balls are only in the scene during the reveals and the lowering; cups occlude them naturally
+    const starts = ep.starts ?? [ep.start];
+    for (let i = 0; i < balls.length; i++) {
+        if (i >= starts.length) { balls[i].visible = false; continue; }
+        let slot = starts[i];
+        for (let s = 0; s < Math.min(n, k - 1); s++) {
+            const [a, b] = ep.swaps[s];
+            if (slot === a) slot = b; else if (slot === b) slot = a;
+        }
+        balls[i].visible = k <= 1 || k === n + 2;
+        balls[i].position.x = POS[slot];
+    }
+}
+
+async function renderEpisode(ep) {
+    const numFrames = 20 * ep.swaps.length + 57;
+    const muxer = new Mp4Muxer.Muxer({
+        target: new Mp4Muxer.ArrayBufferTarget(),
+        video: { codec: 'vp9', width: W, height: H, frameRate: FPS },
+        fastStart: 'in-memory',
+    });
+    let encoderError = null;
+    const encoder = new VideoEncoder({
+        output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+        error: e => { encoderError = e; },
+    });
+    // VP9, not H.264: the cluster's Fedora Chromium has no H.264 encoder (VP8/VP9/AV1 only)
+    encoder.configure({ codec: 'vp09.00.10.08', width: W, height: H, bitrate: BITRATE, framerate: FPS });
+
+    for (let f = 0; f < numFrames; f++) {
+        if (encoderError) throw encoderError;
+        setFrame(f, ep);
+        renderer.render(scene, camera);
+        const frame = new VideoFrame(canvas, { timestamp: Math.round(f * 1e6 / FPS), duration: Math.round(1e6 / FPS) });
+        encoder.encode(frame, { keyFrame: f % (FPS * 2) === 0 });
+        frame.close();
+        if (encoder.encodeQueueSize > 16) await new Promise(r => setTimeout(r, 0));
+    }
+    await encoder.flush();
+    encoder.close();
+    if (encoderError) throw encoderError;
+    muxer.finalize();
+    return muxer.target.buffer;
+}
+
+async function main() {
+    const worker = new URLSearchParams(location.search).get('w') || '0';
+    const gl = renderer.getContext();
+    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+    await fetch(`/log?w=${worker}`, { method: 'POST', body: dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : 'unknown GL' });
+    while (true) {
+        const task = await (await fetch(`/task?w=${worker}`)).json();
+        if (task.done) break;
+        if (task.wait) { await new Promise(r => setTimeout(r, 500)); continue; }
+        try {
+            const mp4 = await renderEpisode(task);
+            await fetch(`/result?id=${task.id}`, { method: 'POST', body: mp4 });
+        } catch (e) {
+            await fetch(`/log?w=${worker}&id=${task.id}`, { method: 'POST', body: `ERROR ${e}` });
+        }
+    }
+}
+main();
+</script>
+</body>
+</html>
