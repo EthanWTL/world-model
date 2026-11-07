@@ -141,7 +141,7 @@ class RubikEvaluator:
         return (res, per) if per_episode else res
 
     @torch.no_grad()
-    def run_saved(self, root, per_episode=False):
+    def run_saved(self, root, per_episode=False, vae=True):
         # 评 infer.py 存下来的 latent（远端推理拿回来的）：root/nXX/{free,tf}.npy + ids.json；GT latent（vae 上限）从本地数据集读
         root, res, per = Path(root), {}, {}
         for n, ds in self.data.items():
@@ -161,7 +161,7 @@ class RubikEvaluator:
                 idx = list(range(i, min(i + self.batch, E)))
                 eps = [ds.eps[pos[ids[j]]] for j in idx]
                 x0 = default_collate([ds[pos[ids[j]]] for j in idx])["latent"].cuda()
-                last4 = {"vae": x0[:, :, 5 * (K - 4):]}
+                last4 = {"vae": x0[:, :, 5 * (K - 4):]} if vae else {}
                 for m, arr in saved.items():
                     z = torch.from_numpy(np.array(arr[idx[0]:idx[-1] + 1])).cuda().float()
                     last4[m] = z[:, :, 5 * (K - 4):] if m == "free" else z
@@ -184,13 +184,14 @@ def main():
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--videos", type=int, default=2)
     ap.add_argument("--gpu", type=int, default=0)
+    ap.add_argument("--no-vae", action="store_true")  # 不算 VAE 上限（同一个测试集每次都一样，评一个 job 时算一次就够）
     args = ap.parse_args()
     torch.cuda.set_device(args.gpu)
     done = json.loads((Path(args.saved) / "done.json").read_text())
     out = Path(args.out)
     ev = RubikEvaluator(tuple(done["moves"]), args.num, args.batch, modes=tuple(done["protocols"]), videos=args.videos,
                         video_dir=out.with_suffix(""))
-    res, per = ev.run_saved(args.saved, per_episode=True)
+    res, per = ev.run_saved(args.saved, per_episode=True, vae=not args.no_vae)
     for k, v in res.items():
         if k.endswith(("_acc", "_hid", "_vis")):
             print(f"{k}: {v:.4f}", flush=True)

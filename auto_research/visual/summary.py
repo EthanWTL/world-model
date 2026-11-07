@@ -64,7 +64,8 @@ def rubik_table(filters, out=None):
             vals = [r.get(f"n{n:02d}_{metric}") for n in MOVES]
             if all(v is None for v in vals):
                 continue
-            vae = vae or [r.get(f"n{n:02d}_vae_{metric.split('_', 1)[1]}") for n in MOVES]
+            if not vae or all(v is None for v in vae):  # VAE 上限只有一个 json 里算了（handback eval 只算一次）
+                vae = [r.get(f"n{n:02d}_vae_{metric.split('_', 1)[1]}") for n in MOVES]
             lines.append(f"{(run + '/' + stem)[:40]:40s}" + "".join(f"{v:7.3f}" if v is not None else f"{'-':>7s}" for v in vals))
         if vae and any(v is not None for v in vae):
             lines.append(f"{'(vae ceiling)':40s}" + "".join(f"{v:7.3f}" if v is not None else f"{'-':>7s}" for v in vae))

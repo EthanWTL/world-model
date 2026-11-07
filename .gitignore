@@ -20,5 +20,6 @@ outputs/
 *.mp4
 *.gif
 
-# personal notes (not code)
+# personal files (not code)
 doc/
+CV/

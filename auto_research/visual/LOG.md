@@ -266,3 +266,69 @@ Rendering details:
   - The 4 encode workers were left for the user's process to stop. Local dataset: about 22.6K of 60K train, 46 of 64 per test split at 20:40.
   - Direction 2 now runs only on the remote node (the zip). Nothing local is armed.
   - Evaluating the hand-back needs the complete local test splits: re-encode only the test splits (small) when the GPUs are ours again.
+
+### Remote run 1 hand-back (2026-11-06): `riselab/rubik_memory`, folder `rubik_r1_20261106011120`
+
+- Fetched to `Finetune/world/auto_research/visual/remote/rubik_r1_20261106011120/`. 679/679 files match MANIFEST.json (sha256), 43 GB.
+- The remote's `meta.jsonl` sha256 equals ours on every split, so it is the same dataset and the local GT applies.
+- Remote: host pluto-prod-lehany-*, 8 GPUs, wandb on.
+- **Base:** 40K steps in 60 GPU-h, 0.67 s/step on 8 GPUs at batch 2 per GPU, 11 GB. It resumed twice after node moves (e1-3 → e1-4 → e1-5). Loss by step:
+
+  | step | 1K | 2.5K | 5K | 10K | 20K | 30K | 40K |
+  |---|---|---|---|---|---|---|---|
+  | loss | .317 | .064 | .037 | .028 | .020 | .019 | .018 |
+
+  The loss flattens after 20K and barely depends on episode length (K7 .019, K15 .015 at 40K).
+- **Fine-tunes**, 12K steps, 4.7–11.8 GPU-h, 12–24 GB. The last-1K loss shows a clear gap between memory and no memory:
+
+  | run | final loss | `ret` (last chunk, hidden stickers) | `gap` (scramble) |
+  |---|---|---|---|
+  | qkv | .0118 | .0122 | .0098 |
+  | v | .0119 | .0114 | .0093 |
+  | ffn | .0121 | .0132 | .0096 |
+  | q | .0138 | .0154 | .0116 |
+  | qkv_norm | .0138 | .0147 | .0118 |
+  | v_norm | .0139 | .0151 | .0115 |
+  | k | .0143 | .0157 | .0123 |
+  | **ctrl** | **.0532** | **.0527** | |
+
+  - Raw-key v / qkv / ffn learn earlier (at 1K: .047 / .043 / .033, against .054 for ctrl, q, k and the norm variants) and end lower.
+  - The norm variants write much larger dW (relative .5–.9, against .1–.2 raw).
+  - The base's diffusion-forcing loss (.018) is not comparable: noisy context during training.
+- **Inference:** 27 jobs, 10.1 GPU-h. A fine-tune checkpoint takes 18–22 min; the base with full KV 57–58 min.
+- **Not yet evaluated** (no evaluation remotely):
+  - Next: complete the local test splits (54/64 each; `build_rubik.py --encode --splits test`), then `remote/tools/handback.py eval` (one `rubik_eval --saved` per job; VAE ceiling only for base 40K ctx-1; videos only for final checkpoints).
+  - Loss ≠ recall: the beyond-training N (12/16/24) and the raw-v blow-up risk (direction 1) only show in the evaluation.
+
+#### Remote run 1: evaluation (2026-11-06, local GPU 3, per the user)
+
+- Setup:
+  - Completed the local test splits (70 episodes) with `build_rubik.py --encode --splits test`.
+  - Ran `remote/tools/handback.py eval` on all 27 inference jobs, 14:08–17:21; the VAE ceiling was computed once, and videos saved for the final checkpoints.
+  - The summary table is in `remote/rubik_r1_20261106011120/summary_rubik.txt`.
+  - Sanity: the VAE ceiling is 1.000 on every N (32.1–32.2 dB). ctrl and base-ctx0 sit at chance (.12–.13) on every metric.
+- **Last display frame (only stickers hidden during the scramble), free, 12K EMA:**
+
+  | | written / sample | N0 | N2 | N4 | N8 | N12 | N16 | N24 |
+  |---|---|---|---|---|---|---|---|---|
+  | base 40K, full KV (ceiling) | – | 1.000 | .999 | .999 | .992 | .876 | .151 | .127 |
+  | base 20K, full KV | – | 1.000 | .999 | .986 | .835 | .710 | .186 | .132 |
+  | qkv | 3.0M | .999 | .819 | .598 | .335 | .192 | .146 | .134 |
+  | v | 1.0M | .998 | .846 | .562 | .257 | .182 | .151 | .141 |
+  | ffn | 2.0M | .998 | .584 | .344 | .208 | .181 | .148 | .139 |
+  | q | 1.0M | .645 | .303 | .200 | .152 | .142 | .130 | .125 |
+  | v_norm | 1.0M | .968 | .355 | .176 | .136 | .132 | .130 | .124 |
+  | qkv_norm | 3.0M | .971 | .351 | .171 | .134 | .129 | .130 | .129 |
+  | k | 1.0M | .191 | .138 | .122 | .122 | .123 | .121 | .123 |
+  | ctrl / base ctx0 | 0 | .12 | .13 | .13 | .12 | .12–.13 | .12 | .11 |
+
+- **Findings:**
+  1. Native fast weights hold concrete visual content. With no past chunk visible, v / qkv / ffn redraw all 24 stickers seen before the scramble: N0 hidden = .998–.999.
+  2. **Content needs a content path:** v ≈ qkv >> ffn >> q >> k at equal or smaller size. v alone (1.0M written, 4M new params) matches qkv (3.0M, 12M) at N0–N2 and is a little behind at N4–N8. k carries only the last chunk's visible faces: tf display = 1/3·1 + 2/3·.125 = .42 exactly. (Prediction 1 confirmed.)
+  3. **Tracking the permutation is the bottleneck:** accuracy drops fast with N. Within training (N8), the best memory model reaches .34 against the ceiling's .99. Free rollouts also drift on faces that stay visible (qkv N8 .65 vs base .999): at max_ctx 0 every chunk is redrawn from memory.
+  4. **Normalized keys hurt within 12K steps:** v_norm ≈ qkv_norm (identical to 3 decimals). Their writes are ~5× larger (relative dW .5–.9 vs .1–.2) and slower to learn. They give no gain at long N either: raw v did not blow up (prediction 2's raw-v failure did not happen here).
+  5. **Beyond the training length:** the base with full KV holds at N12 (.88) but collapses at N16 / N24 (.15 / .13). At those lengths the memories degrade gracefully and beat it in tf (ffn .27 / .24, v .23 / .21, qkv .21 / .18).
+  6. **Not converged:** at N4 last, from 8K to 12K, qkv .42 → .60, v .22 → .56, ffn .21 → .34. q jumped late (N0 .16 → .65, like direction 1's q jump); the norm variants are still rising (N0 .46 → .97). The base also improved from 20K to 40K at N8 (.84 → .99).
+- **Next (user, 2026-11-06):** decide which runs to lengthen, then run them together with the external-weight baselines in round 2:
+  - an added fast-weight layer per block, delta rule, budget matched to qkv / v;
+  - a LaCT-style SwiGLU fast MLP.

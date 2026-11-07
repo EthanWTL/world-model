@@ -54,6 +54,7 @@ def main():
     ap.add_argument("--claim", action="store_true")
     ap.add_argument("--num-shards", type=int, default=128)
     ap.add_argument("--batch", type=int, default=8)
+    ap.add_argument("--splits", nargs="+", default=None)  # 只编这些 split（例：test/n00 test/n24 或 test = 所有测试 split）
     args = ap.parse_args()
     root = Path(args.root)
 
@@ -80,13 +81,14 @@ def main():
         torch.set_grad_enabled(False)
         vae, mean, std = load_vae()
         scene = RubikScene(args.n, device="cuda")
-        metas = {s: [json.loads(line) for line in open(root / s / "meta.jsonl")] for s in splits_of()}
+        todo_splits = [s for s in splits_of() if not args.splits or any(s == x or s.startswith(x + "/") for x in args.splits)]
+        metas = {s: [json.loads(line) for line in open(root / s / "meta.jsonl")] for s in todo_splits}
         tag = f"{socket.gethostname()}.{os.getpid()}"
         for shard in range(args.num_shards):
             if args.claim and not claim(root, shard, args.num_shards):
                 continue
             t0, done = time.time(), 0
-            for s in splits_of():
+            for s in todo_splits:
                 todo = [ep for ep in metas[s] if ep["id"] % args.num_shards == shard
                         and not latent_path(root, s, ep["id"]).exists()]
                 groups = {}

@@ -66,9 +66,13 @@ def evaluate(args):
         if out.exists():
             print(f"{run}/{ckpt}: evaluated already")
             continue
-        print(f"{run}/{ckpt} -> {out}", flush=True)
-        subprocess.run([PY, "-u", "rubik_eval.py", "--saved", str(job), "--out", str(out), "--videos", str(args.videos),
-                        "--gpu", "0"], cwd=VISUAL, env={**env, "CUDA_VISIBLE_DEVICES": str(args.gpu)}, check=True)
+        # VAE 上限只算一次（base 40K、KV 全留那个 job）；视频只给最终的 checkpoint
+        vae = run == "rubik_base" and ckpt == "ema_040000_ctx-1"
+        videos = args.videos if (ckpt.startswith("ckpt_012000") or run == "rubik_base") else 0
+        print(f"{run}/{ckpt} -> {out} (vae {vae}, videos {videos})", flush=True)
+        subprocess.run([PY, "-u", "rubik_eval.py", "--saved", str(job), "--out", str(out), "--videos", str(videos),
+                        "--gpu", "0"] + ([] if vae else ["--no-vae"]), cwd=VISUAL,
+                       env={**env, "CUDA_VISIBLE_DEVICES": str(args.gpu)}, check=True)
     subprocess.run([PY, "summary.py", "--task", "rubik", "--out", str(root / "summary_rubik.txt")], cwd=VISUAL,
                    env={**env, "VM_OUT_DIR": str(root)}, check=True)
 
